@@ -97,17 +97,19 @@ def parse_image_candidates(value: Any) -> list[str]:
 
 
 def dataframe_to_seedance_products(df: pd.DataFrame) -> list[dict[str, Any]]:
-    """Map the sniper CSV rows into the Seedance Studio import schema."""
+    """Send only TikTok links plus Sniper research data to Seedance.
+
+    Seedance deliberately re-scrapes every TikTok link with its normal product
+    scraper so it can collect the same official listing photos and customer
+    review photos that appear when links are pasted directly into Seedance.
+    """
     products: list[dict[str, Any]] = []
     for raw_row in df.to_dict(orient="records"):
         row = {str(key): clean_value(value) for key, value in raw_row.items()}
         name = str(row.get("product") or row.get("product_name") or "Unknown Product").strip()
         source_url = str(row.get("tiktok_link") or row.get("product_link") or "").strip()
-        primary_image = str(row.get("image_url") or "").strip()
-
-        image_urls = parse_image_candidates(row.get("image_candidates_json"))
-        if primary_image.startswith(("http://", "https://")) and primary_image not in image_urls:
-            image_urls.insert(0, primary_image)
+        if not source_url.startswith(("http://", "https://")):
+            continue
 
         metadata = {
             key: value
@@ -118,13 +120,10 @@ def dataframe_to_seedance_products(df: pd.DataFrame) -> list[dict[str, Any]]:
             {
                 "name": name,
                 "source_url": source_url,
-                "images": image_urls,
-                "listing_images": image_urls,
-                "review_images": [],
-                "primary_image_url": image_urls[0] if image_urls else "",
                 "caption": str(row.get("caption") or "").strip(),
                 "scene_prompt": str(row.get("scene_prompt") or "").strip(),
                 "sniper_meta": metadata,
+                "transfer_mode": "tiktok_link_rescrape",
             }
         )
     return products
@@ -195,7 +194,7 @@ def send_batch_to_seedance(
     if not products:
         return False, "The CSV does not contain any products to send.", None
 
-    batch_id = hashlib.sha256(csv_path.read_bytes()).hexdigest()[:20]
+    batch_id = hashlib.sha256(csv_path.read_bytes() + b"|tiktok-link-rescrape-v2").hexdigest()[:20]
     created_at = dt.datetime.now(dt.timezone.utc).isoformat()
     payload = {
         "schema": QUEUE_SCHEMA,
@@ -206,6 +205,7 @@ def send_batch_to_seedance(
         "preset": preset_name,
         "created_at": created_at,
         "product_count": len(products),
+        "transfer_mode": "tiktok_link_rescrape",
         "products": products,
     }
 
@@ -269,8 +269,8 @@ if not env_path.exists():
 
 st.title("🎯 Momentum Sniper")
 st.caption(
-    "Pick a preset, run the hunt, review the results, then send the complete "
-    "product batch directly to the Seedance Studio inbox."
+    "Pick a preset, run the hunt, then send the TikTok product links to Seedance. "
+    "Seedance re-scrapes each link to collect listing and review photos using its normal flow."
 )
 
 preset_choice = st.selectbox("Preset", MOMENTUM_PRESETS + ["Custom…"])
@@ -334,8 +334,8 @@ else:
             use_container_width=True,
             disabled=not queue_ready,
             help=(
-                "Queues the names, TikTok links, image references, caption, scene prompt, "
-                "and all sniper metrics for Seedance Studio."
+                "Queues the TikTok links, names, captions, scene prompts, and Sniper metrics. "
+                "Seedance then re-scrapes every link for official and review photos."
             ),
         )
 
@@ -347,7 +347,7 @@ else:
 
     if send_clicked:
         preset_from_file = latest.name.removeprefix("snipe-").rsplit("-", 1)[0]
-        with st.spinner("Sending the scraped batch to Seedance Studio…"):
+        with st.spinner("Sending TikTok links and Sniper data to Seedance Studio…"):
             ok, message, handoff_url = send_batch_to_seedance(
                 latest, df, preset_from_file
             )
