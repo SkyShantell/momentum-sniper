@@ -1,20 +1,40 @@
 """Momentum Sniper — Streamlit front-end for snipe.py.
 
-Lets a VA pick a preset and run the hunt without touching the terminal
-or ever seeing the underlying Kalodata/Firecrawl credentials.
+Lets a VA pick a Kalodata preset, run the hunt, review the result, and send the
+scraped product batch into the Seedance Studio inbox without re-pasting links.
 """
+from __future__ import annotations
+
+import base64
+import datetime as dt
+import hashlib
+import json
 import os
+import pathlib
 import subprocess
 import sys
-import pathlib
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
 BASE = pathlib.Path(__file__).parent
 MOMENTUM_PRESETS = ["HighTicket", "Lurkers", "Hardcore", "100 GAP"]
+QUEUE_SCHEMA = "momentum.seedance.batch.v1"
 
 st.set_page_config(page_title="Momentum Sniper", page_icon="🎯", layout="wide")
+
+
+def get_secret(key: str, default: str = "") -> str:
+    """Read a Streamlit secret first, then fall back to an environment variable."""
+    try:
+        value = st.secrets.get(key, default)
+    except (FileNotFoundError, KeyError):
+        value = os.environ.get(key, default)
+    return str(value or default)
 
 
 def check_password() -> bool:
@@ -22,12 +42,11 @@ def check_password() -> bool:
     if st.session_state.get("authed"):
         return True
 
-    def on_submit():
-        expected = st.secrets.get("APP_PASSWORD", "")
-        if expected and st.session_state.get("pw_input") == expected:
-            st.session_state["authed"] = True
-        else:
-            st.session_state["authed"] = False
+    def on_submit() -> None:
+        expected = get_secret("APP_PASSWORD")
+        st.session_state["authed"] = bool(
+            expected and st.session_state.get("pw_input") == expected
+        )
 
     st.text_input("Password", type="password", key="pw_input", on_change=on_submit)
     if st.session_state.get("authed") is False:
@@ -35,30 +54,230 @@ def check_password() -> bool:
     return False
 
 
+def clean_value(value: Any) -> Any:
+    """Convert pandas/numpy values into JSON-safe Python values."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def parse_image_candidates(value: Any) -> list[str]:
+    """Read the optional JSON candidate list written by newer sniper runs."""
+    if value is None:
+        return []
+    parsed: Any = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = [part.strip() for part in text.split("|") if part.strip()]
+    if not isinstance(parsed, list):
+        return []
+    result: list[str] = []
+    for item in parsed:
+        url = str(item or "").strip()
+        if url.startswith(("http://", "https://")) and url not in result:
+            result.append(url)
+    return result
+
+
+def dataframe_to_seedance_products(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Map the sniper CSV rows into the Seedance Studio import schema."""
+    products: list[dict[str, Any]] = []
+    for raw_row in df.to_dict(orient="records"):
+        row = {str(key): clean_value(value) for key, value in raw_row.items()}
+        name = str(row.get("product") or row.get("product_name") or "Unknown Product").strip()
+        source_url = str(row.get("tiktok_link") or row.get("product_link") or "").strip()
+        primary_image = str(row.get("image_url") or "").strip()
+
+        image_urls = parse_image_candidates(row.get("image_candidates_json"))
+        if primary_image.startswith(("http://", "https://")) and primary_image not in image_urls:
+            image_urls.insert(0, primary_image)
+
+        metadata = {
+            key: value
+            for key, value in row.items()
+            if value not in (None, "")
+        }
+        products.append(
+            {
+                "name": name,
+                "source_url": source_url,
+                "images": image_urls,
+                "listing_images": image_urls,
+                "review_images": [],
+                "primary_image_url": image_urls[0] if image_urls else "",
+                "caption": str(row.get("caption") or "").strip(),
+                "scene_prompt": str(row.get("scene_prompt") or "").strip(),
+                "sniper_meta": metadata,
+            }
+        )
+    return products
+
+
+def queue_config() -> dict[str, str]:
+    return {
+        "token": get_secret("SEEDANCE_QUEUE_GITHUB_TOKEN").strip(),
+        "repo": get_secret("SEEDANCE_QUEUE_REPO").strip().strip("/"),
+        "branch": get_secret("SEEDANCE_QUEUE_BRANCH", "main").strip() or "main",
+        "path": get_secret("SEEDANCE_QUEUE_PATH", "seedance_inbox").strip().strip("/") or "seedance_inbox",
+        "app_url": get_secret("SEEDANCE_APP_URL").strip(),
+    }
+
+
+def github_api_request(
+    method: str,
+    url: str,
+    token: str,
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any] | list[Any] | None, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "momentum-sniper-seedance-bridge",
+    }
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url, method=method, headers=headers, data=data)
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            body = response.read().decode("utf-8", "replace")
+            parsed = json.loads(body) if body else None
+            return response.status, parsed, ""
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(body) if body else None
+        except json.JSONDecodeError:
+            parsed = None
+        message = ""
+        if isinstance(parsed, dict):
+            message = str(parsed.get("message") or parsed)
+        return exc.code, parsed, message or body[:500]
+    except Exception as exc:
+        return 0, None, str(exc)
+
+
+def send_batch_to_seedance(
+    csv_path: pathlib.Path,
+    df: pd.DataFrame,
+    preset_name: str,
+) -> tuple[bool, str, str | None]:
+    """Create one JSON batch file in a dedicated private GitHub queue repo."""
+    config = queue_config()
+    missing = [
+        key
+        for key in ("token", "repo")
+        if not config.get(key)
+    ]
+    if missing:
+        return False, "Seedance queue is not configured in Streamlit Secrets.", None
+
+    products = dataframe_to_seedance_products(df)
+    if not products:
+        return False, "The CSV does not contain any products to send.", None
+
+    batch_id = hashlib.sha256(csv_path.read_bytes()).hexdigest()[:20]
+    created_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    payload = {
+        "schema": QUEUE_SCHEMA,
+        "batch_id": batch_id,
+        "status": "pending",
+        "source": "Momentum Sniper",
+        "source_file": csv_path.name,
+        "preset": preset_name,
+        "created_at": created_at,
+        "product_count": len(products),
+        "products": products,
+    }
+
+    queue_path = f"{config['path']}/{batch_id}.json"
+    encoded_path = urllib.parse.quote(queue_path, safe="/")
+    endpoint = f"https://api.github.com/repos/{config['repo']}/contents/{encoded_path}"
+    put_payload = {
+        "message": f"Queue Momentum Sniper batch {batch_id}",
+        "content": base64.b64encode(
+            json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii"),
+        "branch": config["branch"],
+    }
+    status, response, error = github_api_request(
+        "PUT", endpoint, config["token"], put_payload
+    )
+
+    if status in (200, 201):
+        message = f"Sent {len(products)} product(s) to the Seedance inbox."
+    elif status == 422:
+        # A deterministic filename prevents duplicate queue entries. Treat an
+        # existing path as already queued instead of creating a second batch.
+        get_url = endpoint + "?" + urllib.parse.urlencode({"ref": config["branch"]})
+        get_status, _existing, _get_error = github_api_request(
+            "GET", get_url, config["token"]
+        )
+        if get_status == 200:
+            message = f"This {len(products)}-product batch is already waiting in Seedance."
+        else:
+            return False, f"GitHub queue rejected the batch: {error or 'HTTP 422'}", None
+    else:
+        return False, f"Could not send to the Seedance queue: {error or f'HTTP {status}'}", None
+
+    handoff_url = None
+    if config.get("app_url"):
+        separator = "&" if "?" in config["app_url"] else "?"
+        handoff_url = (
+            f"{config['app_url']}{separator}"
+            + urllib.parse.urlencode({"sniper_batch": queue_path})
+        )
+    return True, message, handoff_url
+
+
 if not check_password():
     st.stop()
 
 # On Streamlit Cloud there's no .env file — bridge secrets -> .env once so
-# snipe.py (unchanged) can read credentials the same way it does locally.
+# snipe.py can read credentials the same way it does locally.
 env_path = BASE / ".env"
 if not env_path.exists():
     required = ["KALODATA_EMAIL", "KALODATA_PASSWORD", "FIRECRAWL_API_KEY"]
     optional = ["DIRECTOR_INGEST_KEY", "DIRECTOR_INGEST_URL"]
-    missing = [k for k in required if k not in st.secrets]
+    missing = [key for key in required if not get_secret(key)]
     if missing:
         st.error(f"Missing secret(s) in Streamlit Cloud settings: {', '.join(missing)}")
         st.stop()
-    lines = [f"{k}={st.secrets[k]}" for k in required]
-    lines += [f"{k}={st.secrets[k]}" for k in optional if k in st.secrets]
-    env_path.write_text("\n".join(lines) + "\n")
+    lines = [f"{key}={get_secret(key)}" for key in required]
+    lines += [f"{key}={get_secret(key)}" for key in optional if get_secret(key)]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.chmod(env_path, 0o600)
 
 st.title("🎯 Momentum Sniper")
-st.caption("Pick a preset, run the hunt, review the results before hitting Generate All in Bulk Factory.")
+st.caption(
+    "Pick a preset, run the hunt, review the results, then send the complete "
+    "product batch directly to the Seedance Studio inbox."
+)
 
 preset_choice = st.selectbox("Preset", MOMENTUM_PRESETS + ["Custom…"])
 if preset_choice == "Custom…":
-    preset = st.text_input("Custom preset name (must match a filter saved in Kalodata)").strip()
+    preset = st.text_input(
+        "Custom preset name (must match a filter saved in Kalodata)"
+    ).strip()
 else:
     preset = preset_choice
 
@@ -76,6 +295,7 @@ if run_clicked:
             text=True,
             bufsize=1,
         )
+        assert proc.stdout is not None
         for line in proc.stdout:
             lines.append(line.rstrip())
             log_box.code("\n".join(lines[-40:]))
@@ -88,7 +308,7 @@ if run_clicked:
 st.divider()
 st.subheader("Latest results")
 
-csvs = sorted(BASE.glob("snipe-*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+csvs = sorted(BASE.glob("snipe-*.csv"), key=lambda path: path.stat().st_mtime, reverse=True)
 if not csvs:
     st.info("No runs yet. Pick a preset above and hit Run.")
 else:
@@ -96,18 +316,72 @@ else:
     st.write(f"**{latest.name}**")
     df = pd.read_csv(latest)
     st.dataframe(df, use_container_width=True)
-    st.download_button("Download CSV", latest.read_bytes(), file_name=latest.name)
+
+    action_col_1, action_col_2 = st.columns(2)
+    with action_col_1:
+        st.download_button(
+            "⬇️ Download CSV",
+            latest.read_bytes(),
+            file_name=latest.name,
+            use_container_width=True,
+        )
+    with action_col_2:
+        config = queue_config()
+        queue_ready = bool(config["token"] and config["repo"])
+        send_clicked = st.button(
+            "🚀 Send scraped products to Seedance",
+            type="primary",
+            use_container_width=True,
+            disabled=not queue_ready,
+            help=(
+                "Queues the names, TikTok links, image references, caption, scene prompt, "
+                "and all sniper metrics for Seedance Studio."
+            ),
+        )
+
+    if not queue_ready:
+        st.info(
+            "To enable the Seedance handoff, add `SEEDANCE_QUEUE_GITHUB_TOKEN` and "
+            "`SEEDANCE_QUEUE_REPO` to this app's Streamlit Secrets."
+        )
+
+    if send_clicked:
+        preset_from_file = latest.name.removeprefix("snipe-").rsplit("-", 1)[0]
+        with st.spinner("Sending the scraped batch to Seedance Studio…"):
+            ok, message, handoff_url = send_batch_to_seedance(
+                latest, df, preset_from_file
+            )
+        if ok:
+            st.success(message)
+            st.session_state["latest_seedance_handoff_url"] = handoff_url
+        else:
+            st.error(message)
+
+    handoff_url = st.session_state.get("latest_seedance_handoff_url")
+    if handoff_url:
+        try:
+            st.link_button(
+                "Open this batch in Seedance Studio ↗",
+                handoff_url,
+                use_container_width=True,
+            )
+        except AttributeError:
+            st.markdown(f"[Open this batch in Seedance Studio ↗]({handoff_url})")
 
     imgdir = BASE / "sniped-products"
-    if imgdir.exists():
-        wanted = set(df["image_file"].dropna())
-        imgs = [imgdir / f for f in wanted if (imgdir / f).exists()]
+    if imgdir.exists() and "image_file" in df.columns:
+        wanted = set(df["image_file"].dropna().astype(str))
+        imgs = [imgdir / filename for filename in wanted if (imgdir / filename).exists()]
         if imgs:
             cols = st.columns(4)
-            for i, img in enumerate(imgs):
-                with cols[i % 4]:
-                    st.image(str(img), caption=img.stem, use_container_width=True)
+            for index, image_path in enumerate(imgs):
+                with cols[index % 4]:
+                    st.image(
+                        str(image_path),
+                        caption=image_path.stem,
+                        use_container_width=True,
+                    )
 
     with st.expander("Past runs"):
-        for p in csvs[1:]:
-            st.write(p.name)
+        for path in csvs[1:]:
+            st.write(path.name)

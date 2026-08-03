@@ -67,3 +67,28 @@ If you run Claude Code, open it in your sniper folder and just say "run the snip
 - Captions come from the universal bank only. Never put a discount percentage on screen unless you're tracking it (ask the coaches about the discount rules).
 
 Stuck? Screenshot the error into the Discord and tag a coach.
+
+## SOP 4 — Send the scraped batch to Seedance Studio
+
+The Streamlit version includes **Send scraped products to Seedance**. This transfers the product names, TikTok Shop links, image candidates, caption, scene prompt, and research metrics into the Seedance Studio inbox.
+
+Because Momentum Sniper and Seedance Studio are separate Streamlit apps, they share a tiny private GitHub queue repository.
+
+1. Create a private GitHub repository such as `seedance-queue` and initialize it with a README.
+2. Create a fine-grained GitHub token with **Contents: Read and write** access to that repository.
+3. Add these secrets to **both** Streamlit apps:
+
+```toml
+SEEDANCE_QUEUE_GITHUB_TOKEN = "github_pat_..."
+SEEDANCE_QUEUE_REPO = "your-github-name/seedance-queue"
+SEEDANCE_QUEUE_BRANCH = "main"
+SEEDANCE_QUEUE_PATH = "seedance_inbox"
+```
+
+4. Add this only to Momentum Sniper so it can display a direct handoff link after sending:
+
+```toml
+SEEDANCE_APP_URL = "https://your-seedance-app.streamlit.app"
+```
+
+After a hunt finishes, click **Send scraped products to Seedance**. In Seedance Studio, open **Momentum Sniper Inbox**, choose the batch, and click **Import products into Seedance**. Imported batches are marked as imported in the queue so they do not appear again.

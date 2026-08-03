@@ -429,8 +429,9 @@ def main():
         # image_file/image_url lead so the AI Director import can match each row
         # to its downloaded photo. Drag the sniped-products folder into Bulk
         # Factory and drop this CSV on top; names + captions fill themselves in.
-        w.writerow(["product", "image_file", "image_url", "avg_price", "revenue_7d", "growth_pct",
-                    "commission_pct", "per_sale_$", "creators", "ads_top10", "shop", "tiktok_link",
+        w.writerow(["product", "image_file", "image_url", "image_candidates_json",
+                    "avg_price", "revenue_7d", "growth_pct", "commission_pct",
+                    "per_sale_$", "creators", "ads_top10", "shop", "tiktok_link",
                     "caption", "scene_prompt"])
         for p in final:
             p["caption"] = caption(p["id"], p["name"])
@@ -442,6 +443,7 @@ def main():
             if got:
                 saved += 1
             w.writerow([p["name"], fname if got else "", p.get("img") or "",
+                        json.dumps(p.get("image_candidates") or [], ensure_ascii=False),
                         p["avg_price"], p["revenue"], p["growth"], p["commission"],
                         per_sale, p["creators"], p["ads"],
                         p["shop"], f"https://shop.tiktok.com/view/product/{p['id']}",
