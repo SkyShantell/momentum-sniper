@@ -422,7 +422,8 @@ def main():
         p["image_candidates"] = cands[:6]
     imgdir = BASE / "sniped-products"
     imgdir.mkdir(exist_ok=True)
-    out = BASE / f"snipe-{preset.replace(' ','')}-{datetime.date.today()}.csv"
+    run_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out = BASE / f"snipe-{preset.replace(' ','')}-{run_stamp}.csv"
     saved, pushed = 0, 0
     with open(out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)

@@ -8,9 +8,11 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import hashlib
+import io
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import urllib.error
@@ -135,6 +137,7 @@ def queue_config() -> dict[str, str]:
         "repo": get_secret("SEEDANCE_QUEUE_REPO").strip().strip("/"),
         "branch": get_secret("SEEDANCE_QUEUE_BRANCH", "main").strip() or "main",
         "path": get_secret("SEEDANCE_QUEUE_PATH", "seedance_inbox").strip().strip("/") or "seedance_inbox",
+        "history_path": get_secret("SNIPER_HISTORY_GITHUB_PATH", "sniper_history").strip().strip("/") or "sniper_history",
         "app_url": get_secret("SEEDANCE_APP_URL").strip(),
     }
 
@@ -173,6 +176,106 @@ def github_api_request(
         return exc.code, parsed, message or body[:500]
     except Exception as exc:
         return 0, None, str(exc)
+
+
+
+def preset_from_csv_name(filename: str) -> str:
+    """Recover the Kalodata preset from old and timestamped CSV filenames."""
+    stem = pathlib.Path(filename).stem
+    if stem.startswith("snipe-"):
+        stem = stem[len("snipe-"):]
+    stem = re.sub(
+        r"-\d{4}-\d{2}-\d{2}(?:_\d{2}-\d{2}-\d{2})?$",
+        "",
+        stem,
+    )
+    return stem or "Unknown"
+
+
+def archive_csv_to_github(csv_path: pathlib.Path) -> tuple[bool, str]:
+    """Persist one CSV in the same private GitHub repo used by the Seedance queue."""
+    config = queue_config()
+    if not config.get("token") or not config.get("repo"):
+        return False, "Private CSV history is not configured."
+
+    archive_path = f"{config['history_path']}/{csv_path.name}"
+    encoded_path = urllib.parse.quote(archive_path, safe="/")
+    endpoint = f"https://api.github.com/repos/{config['repo']}/contents/{encoded_path}"
+    payload = {
+        "message": f"Archive Momentum Sniper run {csv_path.name}",
+        "content": base64.b64encode(csv_path.read_bytes()).decode("ascii"),
+        "branch": config["branch"],
+    }
+    status, _response, error = github_api_request(
+        "PUT", endpoint, config["token"], payload
+    )
+    if status in (200, 201):
+        return True, f"Archived {csv_path.name} to private run history."
+    if status == 422:
+        get_url = endpoint + "?" + urllib.parse.urlencode({"ref": config["branch"]})
+        get_status, _existing, _get_error = github_api_request(
+            "GET", get_url, config["token"]
+        )
+        if get_status == 200:
+            return True, f"{csv_path.name} is already in private run history."
+    return False, f"Could not archive {csv_path.name}: {error or f'HTTP {status}'}"
+
+
+def list_archived_csvs() -> tuple[list[dict[str, Any]], str | None]:
+    """List CSVs stored in the private GitHub history folder."""
+    config = queue_config()
+    if not config.get("token") or not config.get("repo"):
+        return [], None
+
+    encoded_path = urllib.parse.quote(config["history_path"], safe="/")
+    endpoint = (
+        f"https://api.github.com/repos/{config['repo']}/contents/{encoded_path}?"
+        + urllib.parse.urlencode({"ref": config["branch"]})
+    )
+    status, response, error = github_api_request(
+        "GET", endpoint, config["token"]
+    )
+    if status == 404:
+        return [], None
+    if status != 200 or not isinstance(response, list):
+        return [], error or f"HTTP {status}"
+
+    entries = []
+    for item in response:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if item.get("type") == "file" and name.lower().endswith(".csv"):
+            entries.append({
+                "name": name,
+                "path": str(item.get("path") or ""),
+                "sha": str(item.get("sha") or ""),
+                "size": int(item.get("size") or 0),
+            })
+    entries.sort(key=lambda item: item["name"], reverse=True)
+    return entries, None
+
+
+def read_archived_csv_bytes(repo_path: str) -> tuple[bytes | None, str | None]:
+    """Download one private archived CSV through the authenticated contents API."""
+    config = queue_config()
+    encoded_path = urllib.parse.quote(repo_path, safe="/")
+    endpoint = (
+        f"https://api.github.com/repos/{config['repo']}/contents/{encoded_path}?"
+        + urllib.parse.urlencode({"ref": config["branch"]})
+    )
+    status, response, error = github_api_request(
+        "GET", endpoint, config["token"]
+    )
+    if status != 200 or not isinstance(response, dict):
+        return None, error or f"HTTP {status}"
+    encoded = str(response.get("content") or "").replace("\n", "")
+    if not encoded:
+        return None, "GitHub returned an empty CSV."
+    try:
+        return base64.b64decode(encoded), None
+    except Exception as exc:
+        return None, f"Could not decode archived CSV: {exc}"
 
 
 def send_batch_to_seedance(
@@ -302,86 +405,217 @@ if run_clicked:
         proc.wait()
     if proc.returncode == 0:
         st.success("Done — see results below.")
+        completed_csvs = sorted(
+            BASE.glob("snipe-*.csv"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if completed_csvs:
+            archived, archive_message = archive_csv_to_github(completed_csvs[0])
+            if archived:
+                st.session_state["history_archive_message"] = archive_message
+            else:
+                st.session_state["history_archive_warning"] = archive_message
     else:
         st.error("Run failed — see log above for the error.")
 
 st.divider()
-st.subheader("Latest results")
+st.subheader("Run history")
+st.caption(
+    "Open, preview, download, and resend any saved CSV. New runs use a timestamped filename, "
+    "so running the same preset twice in one day no longer overwrites the earlier file."
+)
 
-csvs = sorted(BASE.glob("snipe-*.csv"), key=lambda path: path.stat().st_mtime, reverse=True)
-if not csvs:
-    st.info("No runs yet. Pick a preset above and hit Run.")
+if st.session_state.pop("history_archive_message", None):
+    st.success("The newest CSV was also saved to the private GitHub run archive.")
+archive_warning = st.session_state.pop("history_archive_warning", None)
+if archive_warning:
+    st.warning(archive_warning)
+
+local_csvs = sorted(
+    BASE.glob("snipe-*.csv"),
+    key=lambda path: path.stat().st_mtime,
+    reverse=True,
+)
+archived_csvs, archive_list_error = list_archived_csvs()
+
+# Combine local and private-history copies by filename. Prefer the local copy when both exist.
+history_by_name: dict[str, dict[str, Any]] = {}
+for path in local_csvs:
+    history_by_name[path.name] = {
+        "name": path.name,
+        "source": "Local",
+        "local_path": path,
+        "repo_path": None,
+        "size": path.stat().st_size,
+        "modified": path.stat().st_mtime,
+    }
+for item in archived_csvs:
+    existing = history_by_name.get(item["name"])
+    if existing:
+        existing["repo_path"] = item["path"]
+        existing["source"] = "Local + private archive"
+    else:
+        history_by_name[item["name"]] = {
+            "name": item["name"],
+            "source": "Private archive",
+            "local_path": None,
+            "repo_path": item["path"],
+            "size": item.get("size", 0),
+            "modified": 0,
+        }
+
+history_entries = sorted(
+    history_by_name.values(),
+    key=lambda entry: (entry.get("modified", 0), entry["name"]),
+    reverse=True,
+)
+
+if archive_list_error:
+    st.warning(f"Could not load the private CSV archive: {archive_list_error}")
+
+if not history_entries:
+    st.info("No runs yet. Pick a preset above and hit Run sniper.")
 else:
-    latest = csvs[0]
-    st.write(f"**{latest.name}**")
-    df = pd.read_csv(latest)
-    st.dataframe(df, use_container_width=True)
-
-    action_col_1, action_col_2 = st.columns(2)
-    with action_col_1:
-        st.download_button(
-            "⬇️ Download CSV",
-            latest.read_bytes(),
-            file_name=latest.name,
+    controls_col_1, controls_col_2 = st.columns([2.4, 1])
+    with controls_col_1:
+        selected_name = st.selectbox(
+            "Choose a run",
+            options=[entry["name"] for entry in history_entries],
+            key="selected_csv_history",
+        )
+    with controls_col_2:
+        st.write("")
+        sync_clicked = st.button(
+            "☁️ Archive local CSVs",
             use_container_width=True,
-        )
-    with action_col_2:
-        config = queue_config()
-        queue_ready = bool(config["token"] and config["repo"])
-        send_clicked = st.button(
-            "🚀 Send scraped products to Seedance",
-            type="primary",
-            use_container_width=True,
-            disabled=not queue_ready,
-            help=(
-                "Queues the TikTok links, names, captions, scene prompts, and Sniper metrics. "
-                "Seedance then re-scrapes every link for official and review photos."
-            ),
+            disabled=not bool(queue_config().get("token") and queue_config().get("repo")),
+            help="Copies every local CSV into the private GitHub queue repository so it survives Streamlit restarts and redeploys.",
         )
 
-    if not queue_ready:
-        st.info(
-            "To enable the Seedance handoff, add `SEEDANCE_QUEUE_GITHUB_TOKEN` and "
-            "`SEEDANCE_QUEUE_REPO` to this app's Streamlit Secrets."
+    if sync_clicked:
+        synced = 0
+        failures = []
+        progress = st.progress(0, text="Archiving local CSVs…")
+        for index, csv_path in enumerate(local_csvs, start=1):
+            progress.progress((index - 1) / max(1, len(local_csvs)), text=f"Archiving {csv_path.name}")
+            ok, message = archive_csv_to_github(csv_path)
+            if ok:
+                synced += 1
+            else:
+                failures.append(message)
+        progress.progress(1.0, text="Archive sync complete")
+        if synced:
+            st.success(f"Archived {synced} local CSV run(s).")
+        for failure in failures:
+            st.error(failure)
+        st.rerun()
+
+    selected_entry = next(
+        entry for entry in history_entries if entry["name"] == selected_name
+    )
+    selected_bytes: bytes | None = None
+    selected_error: str | None = None
+    local_path = selected_entry.get("local_path")
+    if isinstance(local_path, pathlib.Path) and local_path.exists():
+        selected_bytes = local_path.read_bytes()
+    elif selected_entry.get("repo_path"):
+        selected_bytes, selected_error = read_archived_csv_bytes(
+            str(selected_entry["repo_path"])
         )
 
-    if send_clicked:
-        preset_from_file = latest.name.removeprefix("snipe-").rsplit("-", 1)[0]
-        with st.spinner("Sending TikTok links and Sniper data to Seedance Studio…"):
-            ok, message, handoff_url = send_batch_to_seedance(
-                latest, df, preset_from_file
-            )
-        if ok:
-            st.success(message)
-            st.session_state["latest_seedance_handoff_url"] = handoff_url
-        else:
-            st.error(message)
+    st.caption(
+        f"Storage: {selected_entry['source']} · "
+        f"{int(selected_entry.get('size') or 0):,} bytes"
+    )
 
-    handoff_url = st.session_state.get("latest_seedance_handoff_url")
-    if handoff_url:
+    if selected_error or not selected_bytes:
+        st.error(selected_error or "This CSV could not be loaded.")
+    else:
         try:
-            st.link_button(
-                "Open this batch in Seedance Studio ↗",
-                handoff_url,
-                use_container_width=True,
-            )
-        except AttributeError:
-            st.markdown(f"[Open this batch in Seedance Studio ↗]({handoff_url})")
+            selected_df = pd.read_csv(io.BytesIO(selected_bytes))
+        except Exception as exc:
+            selected_df = pd.DataFrame()
+            st.error(f"Could not read this CSV: {exc}")
 
-    imgdir = BASE / "sniped-products"
-    if imgdir.exists() and "image_file" in df.columns:
-        wanted = set(df["image_file"].dropna().astype(str))
-        imgs = [imgdir / filename for filename in wanted if (imgdir / filename).exists()]
-        if imgs:
-            cols = st.columns(4)
-            for index, image_path in enumerate(imgs):
-                with cols[index % 4]:
-                    st.image(
-                        str(image_path),
-                        caption=image_path.stem,
+        if not selected_df.empty:
+            st.dataframe(selected_df, use_container_width=True)
+
+            action_col_1, action_col_2 = st.columns(2)
+            with action_col_1:
+                st.download_button(
+                    "⬇️ Download selected CSV",
+                    selected_bytes,
+                    file_name=selected_entry["name"],
+                    use_container_width=True,
+                )
+            with action_col_2:
+                config = queue_config()
+                queue_ready = bool(config["token"] and config["repo"])
+                send_clicked = st.button(
+                    "🚀 Send selected run to Seedance",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not queue_ready,
+                    help=(
+                        "Queues the TikTok links, names, captions, scene prompts, and Sniper metrics. "
+                        "Seedance then re-scrapes every link for official and review photos."
+                    ),
+                )
+
+            if not queue_ready:
+                st.info(
+                    "To enable Seedance handoff and permanent CSV history, add "
+                    "`SEEDANCE_QUEUE_GITHUB_TOKEN` and `SEEDANCE_QUEUE_REPO` to this app's Streamlit Secrets."
+                )
+
+            if send_clicked:
+                send_path = local_path
+                if not isinstance(send_path, pathlib.Path) or not send_path.exists():
+                    cache_dir = BASE / ".csv_history_cache"
+                    cache_dir.mkdir(exist_ok=True)
+                    send_path = cache_dir / selected_entry["name"]
+                    send_path.write_bytes(selected_bytes)
+                with st.spinner("Sending TikTok links and Sniper data to Seedance Studio…"):
+                    ok, message, handoff_url = send_batch_to_seedance(
+                        send_path,
+                        selected_df,
+                        preset_from_csv_name(selected_entry["name"]),
+                    )
+                if ok:
+                    st.success(message)
+                    st.session_state["latest_seedance_handoff_url"] = handoff_url
+                else:
+                    st.error(message)
+
+            handoff_url = st.session_state.get("latest_seedance_handoff_url")
+            if handoff_url:
+                try:
+                    st.link_button(
+                        "Open this batch in Seedance Studio ↗",
+                        handoff_url,
                         use_container_width=True,
                     )
+                except AttributeError:
+                    st.markdown(f"[Open this batch in Seedance Studio ↗]({handoff_url})")
 
-    with st.expander("Past runs"):
-        for path in csvs[1:]:
-            st.write(path.name)
+            # Show locally downloaded product photos when they still exist.
+            imgdir = BASE / "sniped-products"
+            if imgdir.exists() and "image_file" in selected_df.columns:
+                wanted = set(selected_df["image_file"].dropna().astype(str))
+                imgs = [
+                    imgdir / filename
+                    for filename in wanted
+                    if (imgdir / filename).exists()
+                ]
+                if imgs:
+                    st.markdown("#### Downloaded product images")
+                    cols = st.columns(4)
+                    for index, image_path in enumerate(imgs):
+                        with cols[index % 4]:
+                            st.image(
+                                str(image_path),
+                                caption=image_path.stem,
+                                use_container_width=True,
+                            )
+
