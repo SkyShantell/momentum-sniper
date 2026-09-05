@@ -131,6 +131,49 @@ def num(s):
     if m.group(2): v *= 1000 if m.group(2).lower() == "k" else 1_000_000
     return v
 
+ITEM_SOLD_DESC_JS = r"""(()=>{
+  const ths=[...document.querySelectorAll('thead th')];
+  const idx=ths.findIndex(th=>/^Item\s*Sold$/i.test((th.innerText||'').replace(/\s+/g,' ').trim()));
+  if(idx<0)return 'item-sold-missing';
+  const th=ths[idx];
+  const aria=((th.getAttribute('aria-sort')||'') || (th.querySelector('[aria-sort]')?.getAttribute('aria-sort')||'')).toLowerCase();
+  if(aria==='descending')return 'item-sold-already-desc-aria';
+  const parseVal=s=>{
+    const m=String(s||'').replace(/,/g,'').trim().match(/([\d.]+)\s*([km])?/i);
+    if(!m)return null; let v=parseFloat(m[1]);
+    if(m[2])v*=m[2].toLowerCase()==='k'?1000:1000000;
+    return v;
+  };
+  const vals=[...document.querySelectorAll('tbody tr')].slice(0,8)
+    .map(r=>parseVal(r.querySelectorAll('td')[idx]?.innerText)).filter(v=>v!==null);
+  const desc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
+  if(desc && aria!=='ascending')return 'item-sold-already-desc-values';
+  const clicker=th.querySelector('button,[role="button"]')||th;
+  clicker.click();
+  return 'item-sold-clicked';
+})()"""
+
+ITEM_SOLD_VERIFY_JS = r"""(()=>{
+  const ths=[...document.querySelectorAll('thead th')];
+  const idx=ths.findIndex(th=>/^Item\s*Sold$/i.test((th.innerText||'').replace(/\s+/g,' ').trim()));
+  if(idx<0)return 'item-sold-missing';
+  const th=ths[idx];
+  const aria=((th.getAttribute('aria-sort')||'') || (th.querySelector('[aria-sort]')?.getAttribute('aria-sort')||'')).toLowerCase();
+  const parseVal=s=>{
+    const m=String(s||'').replace(/,/g,'').trim().match(/([\d.]+)\s*([km])?/i);
+    if(!m)return null; let v=parseFloat(m[1]);
+    if(m[2])v*=m[2].toLowerCase()==='k'?1000:1000000;
+    return v;
+  };
+  const vals=[...document.querySelectorAll('tbody tr')].slice(0,8)
+    .map(r=>parseVal(r.querySelectorAll('td')[idx]?.innerText)).filter(v=>v!==null);
+  const desc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
+  if(aria==='descending'||desc)return 'item-sold-desc-ok';
+  const clicker=th.querySelector('button,[role="button"]')||th;
+  clicker.click();
+  return 'item-sold-clicked-again';
+})()"""
+
 def pull(preset):
     # Presets render as <button>…<div class="truncate">HighTicket</div>…</button>. The click
     # handler lives on the BUTTON — clicking just the inner label does NOT apply the filter
@@ -150,6 +193,14 @@ def pull(preset):
         # you fall back to Kalodata's default top-by-revenue list. 16s is enough paint time.
         {"type": "executeJavascript", "script": click_js},
         {"type": "wait", "milliseconds": 8000},
+        # Make Item Sold the discovery sort and force highest -> lowest. We do NOT blindly
+        # click once: if Kalodata already opened in descending order, leave it alone.
+        # If it is unsorted/ascending, click, wait for the table refresh, verify, and only
+        # click a second time when needed (some table states cycle unsorted -> ascending -> descending).
+        {"type": "executeJavascript", "script": ITEM_SOLD_DESC_JS},
+        {"type": "wait", "milliseconds": 4500},
+        {"type": "executeJavascript", "script": ITEM_SOLD_VERIFY_JS},
+        {"type": "wait", "milliseconds": 4500},
         # Bump page size 10 -> 50 (shadcn "N/Page" combobox) so one read covers the batch.
         {"type": "executeJavascript", "script": "(()=>{const b=[...document.querySelectorAll('[role=combobox]')].find(e=>/\\/\\s*page/i.test(e.textContent||''));if(b){b.click();return 'opened'}return 'nocombo'})()"},
         {"type": "wait", "milliseconds": 1500},
@@ -286,7 +337,7 @@ def vet(cands):
                 p["detail_imgs"] = alts
             if isinstance(ads_raw, (int, float)):
                 detail_signal = True      # the video table was found & counted (even if 0 ads)
-            if brand_ok and ads >= 5:
+            if brand_ok and ads >= 7:
                 kept.append(p)
                 log(f"  KEEP {p['name'][:48]} | {shop or 'shop?'} | ads {ads}/10")
             else:
@@ -395,10 +446,12 @@ def main():
         price = p["avg_price"] or 0
         if price < 8 or price * (p["commission"] or 0) / 100 < 3.00: continue
         keep.append(p)
-    keep.sort(key=lambda x: (-(x["avg_price"] or 0 >= 50), -(x["revenue"] or 0)))
+    # Keep Kalodata's Item Sold (highest -> lowest) order. Do not re-sort by price/revenue
+    # here, because the first VET_TOP products should now be the strongest sellers that
+    # passed our price / commission / restricted-name filters.
     # The AD-icon + shop safety check is MANDATORY and runs by default: it opens each
     # product's detail page and counts how many of its top videos are running ads (7+ = strong,
-    # under 5 = cut). This is what keeps your TikTok account alive. Do not skip it.
+    # under 7 = cut). This is what keeps your TikTok account alive. Do not skip it.
     if ENV.get("SKIP_VET") == "1":
         log(f"SKIP_VET=1 set — passing top {min(VET_TOP, len(keep))} through WITHOUT the AD safety check (review them yourself!)")
         final = keep[:VET_TOP]
