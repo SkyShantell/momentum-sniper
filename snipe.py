@@ -392,9 +392,8 @@ def main():
     keep = []
     for p in pool:
         if any(b in p["name"].lower() for b in RESTRICTED): continue
-        if (p["revenue"] or 0) < 15000: continue
         price = p["avg_price"] or 0
-        if price < 8 or price * (p["commission"] or 0) / 100 < 1.25: continue
+        if price < 8 or price * (p["commission"] or 0) / 100 < 3.00: continue
         keep.append(p)
     keep.sort(key=lambda x: (-(x["avg_price"] or 0 >= 50), -(x["revenue"] or 0)))
     # The AD-icon + shop safety check is MANDATORY and runs by default: it opens each
@@ -422,17 +421,15 @@ def main():
         p["image_candidates"] = cands[:6]
     imgdir = BASE / "sniped-products"
     imgdir.mkdir(exist_ok=True)
-    run_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out = BASE / f"snipe-{preset.replace(' ','')}-{run_stamp}.csv"
+    out = BASE / f"snipe-{preset.replace(' ','')}-{datetime.date.today()}.csv"
     saved, pushed = 0, 0
     with open(out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         # image_file/image_url lead so the AI Director import can match each row
         # to its downloaded photo. Drag the sniped-products folder into Bulk
         # Factory and drop this CSV on top; names + captions fill themselves in.
-        w.writerow(["product", "image_file", "image_url", "image_candidates_json",
-                    "avg_price", "revenue_7d", "growth_pct", "commission_pct",
-                    "per_sale_$", "creators", "ads_top10", "shop", "tiktok_link",
+        w.writerow(["product", "image_file", "image_url", "avg_price", "revenue_7d", "growth_pct",
+                    "commission_pct", "per_sale_$", "creators", "ads_top10", "shop", "tiktok_link",
                     "caption", "scene_prompt"])
         for p in final:
             p["caption"] = caption(p["id"], p["name"])
@@ -444,7 +441,6 @@ def main():
             if got:
                 saved += 1
             w.writerow([p["name"], fname if got else "", p.get("img") or "",
-                        json.dumps(p.get("image_candidates") or [], ensure_ascii=False),
                         p["avg_price"], p["revenue"], p["growth"], p["commission"],
                         per_sale, p["creators"], p["ads"],
                         p["shop"], f"https://shop.tiktok.com/view/product/{p['id']}",
