@@ -146,31 +146,86 @@ def num(s):
     return v
 
 ITEM_SOLD_DESC_JS = r"""(()=>{
-  const ths=[...document.querySelectorAll('thead th')];
-  const idx=ths.findIndex(th=>/^Item\s*Sold$/i.test((th.innerText||'').replace(/\s+/g,' ').trim()));
-  if(idx<0)return 'item-sold-missing';
+  // Work only with the main product table. Kalodata can render extra table/header
+  // markup, and the visible "Item Sold" header may include a sort-arrow character.
+  const tables=[...document.querySelectorAll('table')];
+  const tbl=tables.find(t=>{
+    const txt=(t.querySelector('thead')?.innerText||'').toLowerCase();
+    return txt.includes('product') && (txt.includes('revenue') || txt.includes('commission'));
+  }) || tables[0];
+  if(!tbl)return 'item-sold-missing:no-table';
+
+  const ths=[...tbl.querySelectorAll('thead th')];
+  const clean=s=>String(s||'').toLowerCase().replace(/[^a-z]/g,'');
+  const label=th=>[
+      th.innerText,
+      th.textContent,
+      th.getAttribute('aria-label'),
+      th.getAttribute('title'),
+      th.getAttribute('data-column'),
+      th.getAttribute('data-field')
+    ].map(clean).join('|');
+
+  // Fuzzy match so "Item Sold ↓", "Item\nSold", or similar Kalodata markup still matches.
+  const idx=ths.findIndex(th=>{
+    const x=label(th);
+    return x.includes('itemsold') || x.includes('itemssold');
+  });
+  if(idx<0){
+    const heads=ths.map(th=>(th.innerText||th.textContent||'').replace(/\s+/g,' ').trim()).join(' || ');
+    return 'item-sold-missing:headers=' + heads.slice(0,500);
+  }
+
   const th=ths[idx];
   const aria=((th.getAttribute('aria-sort')||'') || (th.querySelector('[aria-sort]')?.getAttribute('aria-sort')||'')).toLowerCase();
   if(aria==='descending')return 'item-sold-already-desc-aria';
+
   const parseVal=s=>{
     const m=String(s||'').replace(/,/g,'').trim().match(/([\d.]+)\s*([km])?/i);
     if(!m)return null; let v=parseFloat(m[1]);
     if(m[2])v*=m[2].toLowerCase()==='k'?1000:1000000;
     return v;
   };
-  const vals=[...document.querySelectorAll('tbody tr')].slice(0,8)
+  const vals=[...tbl.querySelectorAll('tbody tr')].slice(0,8)
     .map(r=>parseVal(r.querySelectorAll('td')[idx]?.innerText)).filter(v=>v!==null);
+
   const desc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
   if(desc && aria!=='ascending')return 'item-sold-already-desc-values';
-  const clicker=th.querySelector('button,[role="button"]')||th;
+
+  // Prefer the actual sortable control; fall back to the header itself.
+  const clicker=th.querySelector('button,[role="button"],[tabindex]')||th;
   clicker.click();
-  return 'item-sold-clicked';
+  return 'item-sold-clicked:index=' + idx;
 })()"""
 
 ITEM_SOLD_VERIFY_JS = r"""(()=>{
-  const ths=[...document.querySelectorAll('thead th')];
-  const idx=ths.findIndex(th=>/^Item\s*Sold$/i.test((th.innerText||'').replace(/\s+/g,' ').trim()));
-  if(idx<0)return 'item-sold-missing';
+  const tables=[...document.querySelectorAll('table')];
+  const tbl=tables.find(t=>{
+    const txt=(t.querySelector('thead')?.innerText||'').toLowerCase();
+    return txt.includes('product') && (txt.includes('revenue') || txt.includes('commission'));
+  }) || tables[0];
+  if(!tbl)return 'item-sold-missing:no-table';
+
+  const ths=[...tbl.querySelectorAll('thead th')];
+  const clean=s=>String(s||'').toLowerCase().replace(/[^a-z]/g,'');
+  const label=th=>[
+      th.innerText,
+      th.textContent,
+      th.getAttribute('aria-label'),
+      th.getAttribute('title'),
+      th.getAttribute('data-column'),
+      th.getAttribute('data-field')
+    ].map(clean).join('|');
+
+  const idx=ths.findIndex(th=>{
+    const x=label(th);
+    return x.includes('itemsold') || x.includes('itemssold');
+  });
+  if(idx<0){
+    const heads=ths.map(th=>(th.innerText||th.textContent||'').replace(/\s+/g,' ').trim()).join(' || ');
+    return 'item-sold-missing:headers=' + heads.slice(0,500);
+  }
+
   const th=ths[idx];
   const aria=((th.getAttribute('aria-sort')||'') || (th.querySelector('[aria-sort]')?.getAttribute('aria-sort')||'')).toLowerCase();
   const parseVal=s=>{
@@ -179,13 +234,15 @@ ITEM_SOLD_VERIFY_JS = r"""(()=>{
     if(m[2])v*=m[2].toLowerCase()==='k'?1000:1000000;
     return v;
   };
-  const vals=[...document.querySelectorAll('tbody tr')].slice(0,8)
+  const vals=[...tbl.querySelectorAll('tbody tr')].slice(0,8)
     .map(r=>parseVal(r.querySelectorAll('td')[idx]?.innerText)).filter(v=>v!==null);
   const desc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
-  if(aria==='descending'||desc)return 'item-sold-desc-ok';
-  const clicker=th.querySelector('button,[role="button"]')||th;
+
+  if(aria==='descending'||desc)return 'item-sold-desc-ok:index=' + idx;
+
+  const clicker=th.querySelector('button,[role="button"],[tabindex]')||th;
   clicker.click();
-  return 'item-sold-clicked-again';
+  return 'item-sold-clicked-again:index=' + idx;
 })()"""
 
 def pull(preset):
