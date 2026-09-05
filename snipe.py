@@ -82,9 +82,23 @@ def fc(actions, label):
                     break
             if not ok: raise RuntimeError("login wall / not authenticated")
             return vals
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace").strip()
+            except Exception:
+                body = ""
+            msg = f"HTTP {e.code}: {body[:700] or e.reason}"
+            last = RuntimeError(msg)
+            log(f"  Firecrawl error {label}: {msg}")
+            # A 400 means Firecrawl rejected the submitted action payload.
+            # Retrying the exact same payload will not help.
+            if e.code == 400:
+                raise SystemExit(f"{label} failed: {msg}")
+            log(f"  retry {attempt+1}/3 {label}")
+            time.sleep(25)
         except Exception as e:
             last = e
-            log(f"  retry {attempt+1}/3 {label}: {str(e)[:100]}")
+            log(f"  retry {attempt+1}/3 {label}: {str(e)[:180]}")
             time.sleep(25)
     raise SystemExit(f"{label} failed after 3 tries: {last}")
 
@@ -198,9 +212,9 @@ def pull(preset):
         # If it is unsorted/ascending, click, wait for the table refresh, verify, and only
         # click a second time when needed (some table states cycle unsorted -> ascending -> descending).
         {"type": "executeJavascript", "script": ITEM_SOLD_DESC_JS},
-        {"type": "wait", "milliseconds": 4500},
+        {"type": "wait", "milliseconds": 1500},
         {"type": "executeJavascript", "script": ITEM_SOLD_VERIFY_JS},
-        {"type": "wait", "milliseconds": 4500},
+        {"type": "wait", "milliseconds": 1500},
         # Bump page size 10 -> 50 (shadcn "N/Page" combobox) so one read covers the batch.
         {"type": "executeJavascript", "script": "(()=>{const b=[...document.querySelectorAll('[role=combobox]')].find(e=>/\\/\\s*page/i.test(e.textContent||''));if(b){b.click();return 'opened'}return 'nocombo'})()"},
         {"type": "wait", "milliseconds": 1500},
@@ -209,6 +223,10 @@ def pull(preset):
         {"type": "executeJavascript", "script": ROWS_JS},
     ]
     vals = fc(acts, f"pull:{preset}")
+    sort_msgs = [v for v in vals
+                 if isinstance(v, str) and v.startswith("item-sold-")]
+    for m in sort_msgs:
+        log(f"  Item Sold sort: {m}")
     data = None
     for v in vals:
         if isinstance(v, str) and v.lstrip().startswith("{"):
