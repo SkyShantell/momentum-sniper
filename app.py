@@ -39,6 +39,170 @@ def get_secret(key: str, default: str = "") -> str:
     return str(value or default)
 
 
+def get_google_service_account_info() -> dict | None:
+    """Load the same Google service-account format used by Creator Scanner / Flow Fashion."""
+    try:
+        raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    except Exception:
+        raw = None
+    if raw:
+        if isinstance(raw, dict):
+            return dict(raw)
+        try:
+            return json.loads(str(raw))
+        except Exception:
+            pass
+    try:
+        raw = st.secrets.get("gcp_service_account")
+        if raw:
+            return dict(raw)
+    except Exception:
+        pass
+    env_raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if env_raw:
+        try:
+            return json.loads(env_raw)
+        except Exception:
+            pass
+    return None
+
+
+def _column_letter(index: int) -> str:
+    out = ""
+    n = int(index)
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        out = chr(65 + rem) + out
+    return out
+
+
+def _scanner_queue_sheet():
+    info = get_google_service_account_info()
+    sheet_ref = get_secret("GOOGLE_SHEET_URL").strip()
+    if not info or not sheet_ref:
+        raise RuntimeError(
+            "Google Sheets is not configured in Momentum Sniper. Add GOOGLE_SHEET_URL and the same Google service-account credential used by Flow Fashion."
+        )
+    try:
+        import gspread
+    except Exception as exc:
+        raise RuntimeError(
+            "gspread is missing. Add gspread to the Momentum Sniper requirements.txt."
+        ) from exc
+    gc = gspread.service_account_from_dict(info)
+    book = gc.open_by_url(sheet_ref) if sheet_ref.startswith(("http://", "https://")) else gc.open_by_key(sheet_ref)
+    try:
+        ws = book.worksheet("Scanner Queue")
+    except gspread.WorksheetNotFound:
+        # Keep J:L exactly compatible with Flow Fashion's existing Scanner Queue importer.
+        headers = [
+            "Product Name", "Product Link", "Creators", "Creator Count",
+            "Video Count", "Combined Views", "Product Image", "Seller",
+            "Queued At", "Status", "Imported At", "Batch ID",
+        ]
+        ws = book.add_worksheet(title="Scanner Queue", rows=1000, cols=24)
+        ws.update(range_name="A1", values=[headers], value_input_option="RAW")
+    return ws
+
+
+def send_run_to_fashion_flow_queue(
+    df: pd.DataFrame,
+    preset_name: str,
+    source_file: str,
+) -> tuple[bool, str]:
+    """Append a saved Sniper run to the same Scanner Queue used by Creator Scanner."""
+    if df.empty:
+        return False, "This Sniper run has no products to queue."
+    try:
+        ws = _scanner_queue_sheet()
+        values = ws.get_all_values()
+        headers = list(values[0]) if values else []
+
+        # These are appended AFTER the existing queue columns so Flow Fashion's
+        # Status / Imported At / Batch ID columns remain J:K:L.
+        extra_headers = [
+            "Source", "Source Batch ID", "Preset", "Source File",
+            "Ads Top10", "Avg Price", "Commission %", "Per Sale $",
+            "Revenue 7d", "Growth %",
+        ]
+        missing = [h for h in extra_headers if h not in headers]
+        if missing:
+            start_col = len(headers) + 1
+            ws.update(
+                range_name=f"{_column_letter(start_col)}1",
+                values=[missing],
+                value_input_option="RAW",
+            )
+            headers.extend(missing)
+
+        raw_rows = []
+        product_links = []
+        for raw in df.to_dict(orient="records"):
+            row = {str(k): clean_value(v) for k, v in raw.items()}
+            link = str(row.get("tiktok_link") or row.get("product_link") or "").strip()
+            if not link.startswith(("http://", "https://")):
+                continue
+            product_links.append(link)
+            raw_rows.append(row)
+        if not raw_rows:
+            return False, "This CSV does not contain any valid TikTok product links."
+
+        identity = "|".join([str(preset_name or ""), str(source_file or "")] + product_links)
+        source_batch_id = "momentum-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+        existing = set()
+        if len(values) > 1:
+            idx = {name: i for i, name in enumerate(headers)}
+            for old in values[1:]:
+                batch_id = old[idx["Source Batch ID"]] if idx.get("Source Batch ID") is not None and idx["Source Batch ID"] < len(old) else ""
+                link = old[idx["Product Link"]] if idx.get("Product Link") is not None and idx["Product Link"] < len(old) else ""
+                if batch_id == source_batch_id and link:
+                    existing.add(link)
+
+        queued_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        rows_to_append = []
+        for row in raw_rows:
+            link = str(row.get("tiktok_link") or row.get("product_link") or "").strip()
+            if link in existing:
+                continue
+            record = {
+                "Product Name": str(row.get("product") or row.get("product_name") or "Unknown Product").strip(),
+                "Product Link": link,
+                "Creators": row.get("creators") or "",
+                "Creator Count": "",
+                "Video Count": "",
+                "Combined Views": "",
+                "Product Image": row.get("image_url") or "",
+                "Seller": row.get("shop") or "",
+                "Queued At": queued_at,
+                "Status": "Pending",
+                "Imported At": "",
+                "Batch ID": "",
+                "Source": "Momentum Sniper",
+                "Source Batch ID": source_batch_id,
+                "Preset": preset_name or "Custom",
+                "Source File": source_file,
+                "Ads Top10": row.get("ads_top10") or "",
+                "Avg Price": row.get("avg_price") or "",
+                "Commission %": row.get("commission_pct") or "",
+                "Per Sale $": row.get("per_sale_$") or "",
+                "Revenue 7d": row.get("revenue_7d") or "",
+                "Growth %": row.get("growth_pct") or "",
+            }
+            rows_to_append.append([record.get(h, "") for h in headers])
+
+        if not rows_to_append:
+            return True, f"This Sniper run is already waiting in Fashion Flow ({source_batch_id})."
+
+        ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+        return True, (
+            f"Sent {len(rows_to_append)} product(s) to Fashion Flow via Scanner Queue. "
+            f"Open Flow Fashion, choose the avatar, then choose an open avatar batch or start a new one."
+        )
+    except Exception as exc:
+        return False, f"Could not send to Fashion Flow Scanner Queue: {exc}"
+
+
 def check_password() -> bool:
     """Simple shared-password gate. Set APP_PASSWORD in Streamlit secrets."""
     if st.session_state.get("authed"):
@@ -279,133 +443,6 @@ def read_archived_csv_bytes(repo_path: str) -> tuple[bytes | None, str | None]:
 
 
 
-def send_batch_to_flow_fashion(
-    df: pd.DataFrame,
-    preset_name: str,
-    source_file: str,
-) -> tuple[bool, str]:
-    """Send any saved Sniper CSV to the Flow Fashion pending inbox.
-
-    Uses the same deterministic batch identity as snipe.py so re-sending a run
-    that was already auto-pushed will not create a duplicate inbox batch.
-    """
-    api_key = (
-        get_secret("FLOW_FASHION_API_KEY").strip()
-        or get_secret("PHASE1_API_KEY").strip()
-    )
-    if not api_key:
-        return False, (
-            "Flow Fashion is not configured. Add FLOW_FASHION_API_KEY "
-            "(same value as the Flow Fashion PHASE1_API_KEY) to Streamlit Secrets."
-        )
-
-    base_url = get_secret(
-        "FLOW_FASHION_API_URL",
-        "https://flow-fashion-backend-production.up.railway.app",
-    ).strip().rstrip("/")
-
-    products: list[dict[str, Any]] = []
-    product_ids: list[str] = []
-
-    for raw_row in df.to_dict(orient="records"):
-        row = {str(key): clean_value(value) for key, value in raw_row.items()}
-        name = str(
-            row.get("product")
-            or row.get("product_name")
-            or "Unknown Product"
-        ).strip()
-        source_url = str(
-            row.get("tiktok_link")
-            or row.get("product_link")
-            or ""
-        ).strip()
-
-        if not source_url.startswith(("http://", "https://")):
-            continue
-
-        match = re.search(r"/product/(\d+)", source_url)
-        product_id = match.group(1) if match else source_url.rstrip("/").split("/")[-1]
-        product_ids.append(product_id)
-
-        sniper_meta = {
-            "avg_price": row.get("avg_price"),
-            "revenue_7d": row.get("revenue_7d"),
-            "growth_pct": row.get("growth_pct"),
-            "commission_pct": row.get("commission_pct"),
-            "per_sale_$": row.get("per_sale_$"),
-            "creators": row.get("creators"),
-            "ads_top10": row.get("ads_top10"),
-            "shop": row.get("shop"),
-        }
-        sniper_meta = {
-            key: value
-            for key, value in sniper_meta.items()
-            if value not in (None, "")
-        }
-
-        products.append(
-            {
-                "name": name or "Unknown Product",
-                "source_url": source_url,
-                "sniper_meta": sniper_meta,
-            }
-        )
-
-    if not products:
-        return False, "This CSV does not contain any valid TikTok product links."
-
-    identity = "|".join(
-        [str(preset_name or ""), str(source_file or "")]
-        + product_ids
-    )
-    source_batch_id = (
-        "momentum-"
-        + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-    )
-
-    payload = {
-        "source_batch_id": source_batch_id,
-        "preset": preset_name or "Custom",
-        "source_file": source_file,
-        "products": products,
-    }
-
-    request = urllib.request.Request(
-        f"{base_url}/sniper/inbox",
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "X-API-Key": api_key,
-        },
-        data=json.dumps(payload).encode("utf-8"),
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            body = response.read().decode("utf-8", "replace")
-        result = json.loads(body) if body else {}
-
-        status = str(result.get("status") or "pending").lower()
-        if status == "imported":
-            batch_id = str(result.get("imported_batch_id") or "").strip()
-            suffix = f" ({batch_id})" if batch_id else ""
-            return True, (
-                f"This run was already imported into Flow Fashion{suffix}. "
-                "No duplicate was created."
-            )
-
-        return True, (
-            f"Sent {len(products)} product(s) to the Flow Fashion inbox. "
-            "Open Flow Fashion, choose the avatar name, then create the batch."
-        )
-
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:500]
-        return False, f"Flow Fashion rejected the run: HTTP {exc.code}: {detail}"
-    except Exception as exc:
-        return False, f"Could not send to Flow Fashion: {exc}"
-
-
 def send_batch_to_seedance(
     csv_path: pathlib.Path,
     df: pd.DataFrame,
@@ -488,7 +525,7 @@ if not check_password():
 env_path = BASE / ".env"
 if not env_path.exists():
     required = ["KALODATA_EMAIL", "KALODATA_PASSWORD", "FIRECRAWL_API_KEY"]
-    optional = ["DIRECTOR_INGEST_KEY", "DIRECTOR_INGEST_URL", "FLOW_FASHION_API_KEY", "FLOW_FASHION_API_URL"]
+    optional = ["DIRECTOR_INGEST_KEY", "DIRECTOR_INGEST_URL"]
     missing = [key for key in required if not get_secret(key)]
     if missing:
         st.error(f"Missing secret(s) in Streamlit Cloud settings: {', '.join(missing)}")
@@ -500,7 +537,7 @@ if not env_path.exists():
 
 st.title("🎯 Momentum Sniper")
 st.caption(
-    "Pick a preset, run the hunt, then send any current or older run to Seedance or Flow Fashion."
+    "Pick a preset, run the hunt, then send any current or older run to Seedance or Fashion Flow."
 )
 
 preset_choice = st.selectbox("Preset", MOMENTUM_PRESETS + ["Custom…"])
@@ -543,6 +580,15 @@ if run_clicked:
                 st.session_state["history_archive_message"] = archive_message
             else:
                 st.session_state["history_archive_warning"] = archive_message
+            try:
+                latest_df = pd.read_csv(completed_csvs[0])
+                queued, queue_message = send_run_to_fashion_flow_queue(
+                    latest_df, preset, completed_csvs[0].name
+                )
+                key = "fashion_flow_queue_message" if queued else "fashion_flow_queue_warning"
+                st.session_state[key] = queue_message
+            except Exception as exc:
+                st.session_state["fashion_flow_queue_warning"] = f"Automatic Fashion Flow queue push failed: {exc}"
     else:
         st.error("Run failed — see log above for the error.")
 
@@ -558,6 +604,12 @@ if st.session_state.pop("history_archive_message", None):
 archive_warning = st.session_state.pop("history_archive_warning", None)
 if archive_warning:
     st.warning(archive_warning)
+fashion_queue_message = st.session_state.pop("fashion_flow_queue_message", None)
+if fashion_queue_message:
+    st.success(fashion_queue_message)
+fashion_queue_warning = st.session_state.pop("fashion_flow_queue_warning", None)
+if fashion_queue_warning:
+    st.warning(fashion_queue_warning)
 
 local_csvs = sorted(
     BASE.glob("snipe-*.csv"),
@@ -690,17 +742,17 @@ else:
                     ),
                 )
             with action_col_3:
-                flow_key = (
-                    get_secret("FLOW_FASHION_API_KEY").strip()
-                    or get_secret("PHASE1_API_KEY").strip()
+                flow_sheet_ready = bool(
+                    get_secret("GOOGLE_SHEET_URL").strip()
+                    and get_google_service_account_info()
                 )
                 flow_send_clicked = st.button(
                     "👗 Send to Fashion Flow",
                     use_container_width=True,
-                    disabled=not bool(flow_key),
+                    disabled=not flow_sheet_ready,
                     help=(
-                        "Sends this saved Sniper run to the Flow Fashion inbox. "
-                        "It will NOT mix into the current batch. You choose the avatar in Flow Fashion first."
+                        "Queues this saved run into the same Scanner Queue used by Creator Scanner. "
+                        "In Flow Fashion you choose the saved avatar and destination batch before importing."
                     ),
                 )
 
@@ -710,15 +762,15 @@ else:
                     "`SEEDANCE_QUEUE_GITHUB_TOKEN` and `SEEDANCE_QUEUE_REPO` to this app's Streamlit Secrets."
                 )
 
-            if not flow_key:
+            if not flow_sheet_ready:
                 st.info(
-                    "To enable **Send to Fashion Flow**, add `FLOW_FASHION_API_KEY` "
-                    "to this app's Streamlit Secrets. Use the same value as Flow Fashion's `PHASE1_API_KEY`."
+                    "To enable **Send to Fashion Flow**, give Momentum Sniper the same `GOOGLE_SHEET_URL` "
+                    "and Google service-account credential used by Creator Scanner / Flow Fashion."
                 )
 
             if flow_send_clicked:
-                with st.spinner("Sending this saved run to the Flow Fashion inbox…"):
-                    flow_ok, flow_message = send_batch_to_flow_fashion(
+                with st.spinner("Sending this saved run to the Fashion Flow Scanner Queue…"):
+                    flow_ok, flow_message = send_run_to_fashion_flow_queue(
                         selected_df,
                         preset_from_csv_name(selected_entry["name"]),
                         selected_entry["name"],

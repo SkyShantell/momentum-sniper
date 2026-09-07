@@ -379,80 +379,6 @@ def push_to_director(product, img_path):
         log(f"  director push failed for {product['name'][:40]}: {str(e)[:80]}")
         return False
 
-def push_batch_to_flow_fashion(products, preset, source_file):
-    """Push the final vetted winners to the Flow Fashion inbox.
-
-    This does NOT add products to an existing Flow Fashion production batch.
-    They wait in the dashboard until an avatar is selected there.
-    """
-    key = ENV.get("FLOW_FASHION_API_KEY") or ENV.get("PHASE1_API_KEY")
-    if not products:
-        return False
-    if not key:
-        log("  Flow Fashion push skipped: FLOW_FASHION_API_KEY is not configured")
-        return False
-    base_url = ENV.get(
-        "FLOW_FASHION_API_URL",
-        "https://flow-fashion-backend-production.up.railway.app",
-    ).rstrip("/")
-
-    identity = "|".join(
-        [str(preset or ""), str(source_file or "")]
-        + [str(p.get("id") or "") for p in products]
-    )
-    source_batch_id = "momentum-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-
-    payload = {
-        "source_batch_id": source_batch_id,
-        "preset": preset,
-        "source_file": source_file,
-        "products": [],
-    }
-    for p in products:
-        per_sale = p.get("per_sale")
-        if per_sale is None:
-            per_sale = round((p.get("avg_price") or 0) * (p.get("commission") or 0) / 100, 2)
-        payload["products"].append({
-            "name": p.get("name") or "Unknown Product",
-            "source_url": f"https://shop.tiktok.com/view/product/{p.get('id')}",
-            "sniper_meta": {
-                "avg_price": p.get("avg_price"),
-                "revenue_7d": p.get("revenue"),
-                "growth_pct": p.get("growth"),
-                "commission_pct": p.get("commission"),
-                "per_sale_$": per_sale,
-                "creators": p.get("creators"),
-                "ads_top10": p.get("ads"),
-                "shop": p.get("shop"),
-            },
-        })
-
-    try:
-        req = urllib.request.Request(
-            f"{base_url}/sniper/inbox",
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "X-API-Key": key,
-            },
-            data=json.dumps(payload).encode("utf-8"),
-        )
-        with urllib.request.urlopen(req, timeout=90) as response:
-            body = response.read().decode("utf-8", "replace")
-        log(f"Flow Fashion inbox: queued {len(products)} vetted product(s) ({source_batch_id})")
-        return True
-    except urllib.error.HTTPError as e:
-        try:
-            detail = e.read().decode("utf-8", "replace")[:400]
-        except Exception:
-            detail = str(e)
-        log(f"  Flow Fashion push failed: HTTP {e.code}: {detail}")
-        return False
-    except Exception as e:
-        log(f"  Flow Fashion push failed: {str(e)[:300]}")
-        return False
-
-
 def main():
     global ENV
     ENV = env()
@@ -521,13 +447,10 @@ def main():
                         p["caption"], p["scene_prompt"]])
             if push_to_director(p, (imgdir / fname) if got else None):
                 pushed += 1
-    flow_pushed = push_batch_to_flow_fashion(final, preset, out.name)
     log(f"DONE — {len(final)} vetted products -> {out.name}")
     log(f"images -> {imgdir.name}/ ({saved}/{len(final)} downloaded)")
     if pushed:
         log(f"pushed {pushed} straight to your AI Director inbox")
-    if flow_pushed:
-        log(f"pushed {len(final)} vetted products to the Flow Fashion inbox")
 
 if __name__ == "__main__":
     main()
