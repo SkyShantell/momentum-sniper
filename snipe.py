@@ -21,6 +21,7 @@ MOMENTUM_PRESETS = ["HighTicket", "Lurkers", "Hardcore", "100 GAP"]
 VET_TOP = 12
 RESTRICTED = ["crocs", "ninja", "shark", "liquid iv", "liquid i.v"]
 TRUSTED = ["qvc"]
+LAST_SORT_MSGS = []
 
 CAPTIONS = [
     "I am so sorry if you already grabbed an [PRODUCT], because the discount is huge today. 😱😭",
@@ -117,8 +118,14 @@ def login_actions():
     ]
 
 ROWS_JS = r"""JSON.stringify((()=>{
-  const head=[...document.querySelectorAll('thead th')].map(th=>th.innerText.trim());
-  const rows=[...document.querySelectorAll('tbody tr')].filter(r=>r.querySelectorAll('td').length>3);
+  const tables=[...document.querySelectorAll('table')];
+  const tbl=tables.find(t=>{
+    const txt=(t.querySelector('thead')?.innerText||'').toLowerCase();
+    return txt.includes('product') && (txt.includes('revenue') || txt.includes('commission'));
+  }) || tables[0];
+  if(!tbl) return {head:[], rows:[]};
+  const head=[...tbl.querySelectorAll('thead th')].map(th=>(th.innerText||th.textContent||'').trim());
+  const rows=[...tbl.querySelectorAll('tbody tr')].filter(r=>r.querySelectorAll('td').length>3);
   // The product cover + id both live in a CSS background-image whose URL contains
   // .../tiktok.product/<id>/cover.png (Kalodata's shadcn table has no <img> or <a> in rows).
   const findCover=(r)=>{
@@ -146,8 +153,6 @@ def num(s):
     return v
 
 ITEM_SOLD_DESC_JS = r"""(()=>{
-  // Work only with the main product table. Kalodata can render extra table/header
-  // markup, and the visible "Item Sold" header may include a sort-arrow character.
   const tables=[...document.querySelectorAll('table')];
   const tbl=tables.find(t=>{
     const txt=(t.querySelector('thead')?.innerText||'').toLowerCase();
@@ -158,15 +163,9 @@ ITEM_SOLD_DESC_JS = r"""(()=>{
   const ths=[...tbl.querySelectorAll('thead th')];
   const clean=s=>String(s||'').toLowerCase().replace(/[^a-z]/g,'');
   const label=th=>[
-      th.innerText,
-      th.textContent,
-      th.getAttribute('aria-label'),
-      th.getAttribute('title'),
-      th.getAttribute('data-column'),
-      th.getAttribute('data-field')
+      th.innerText, th.textContent, th.getAttribute('aria-label'),
+      th.getAttribute('title'), th.getAttribute('data-column'), th.getAttribute('data-field')
     ].map(clean).join('|');
-
-  // Fuzzy match so "Item Sold ↓", "Item\nSold", or similar Kalodata markup still matches.
   const idx=ths.findIndex(th=>{
     const x=label(th);
     return x.includes('itemsold') || x.includes('itemssold');
@@ -178,24 +177,28 @@ ITEM_SOLD_DESC_JS = r"""(()=>{
 
   const th=ths[idx];
   const aria=((th.getAttribute('aria-sort')||'') || (th.querySelector('[aria-sort]')?.getAttribute('aria-sort')||'')).toLowerCase();
-  if(aria==='descending')return 'item-sold-already-desc-aria';
-
   const parseVal=s=>{
     const m=String(s||'').replace(/,/g,'').trim().match(/([\d.]+)\s*([km])?/i);
     if(!m)return null; let v=parseFloat(m[1]);
     if(m[2])v*=m[2].toLowerCase()==='k'?1000:1000000;
     return v;
   };
-  const vals=[...tbl.querySelectorAll('tbody tr')].slice(0,8)
+  const vals=[...tbl.querySelectorAll('tbody tr')].slice(0,20)
     .map(r=>parseVal(r.querySelectorAll('td')[idx]?.innerText)).filter(v=>v!==null);
+  const nonInc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
+  const strictDown=vals.some((v,i)=>i>0&&vals[i-1]>v);
+  const desc=nonInc&&strictDown;
+  const sample=vals.slice(0,8).join(',');
 
-  const desc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
-  if(desc && aria!=='ascending')return 'item-sold-already-desc-values';
+  // Critical: do NOT treat a flat sample such as 0,0,0,0 as "descending".
+  // That was the failure mode that could leave Kalodata sorted from zero upward.
+  if(aria==='descending' || desc)
+    return 'item-sold-desc-ok:index=' + idx + ':sample=' + sample;
 
-  // Prefer the actual sortable control; fall back to the header itself.
   const clicker=th.querySelector('button,[role="button"],[tabindex]')||th;
   clicker.click();
-  return 'item-sold-clicked:index=' + idx;
+  const state=vals.length<2?'unknown':(vals.every((v,i)=>i===0||vals[i-1]<=v)&&vals.some((v,i)=>i>0&&vals[i-1]<v)?'ascending':'flat/unknown');
+  return 'item-sold-clicked:index=' + idx + ':from=' + state + ':sample=' + sample;
 })()"""
 
 ITEM_SOLD_VERIFY_JS = r"""(()=>{
@@ -209,22 +212,14 @@ ITEM_SOLD_VERIFY_JS = r"""(()=>{
   const ths=[...tbl.querySelectorAll('thead th')];
   const clean=s=>String(s||'').toLowerCase().replace(/[^a-z]/g,'');
   const label=th=>[
-      th.innerText,
-      th.textContent,
-      th.getAttribute('aria-label'),
-      th.getAttribute('title'),
-      th.getAttribute('data-column'),
-      th.getAttribute('data-field')
+      th.innerText, th.textContent, th.getAttribute('aria-label'),
+      th.getAttribute('title'), th.getAttribute('data-column'), th.getAttribute('data-field')
     ].map(clean).join('|');
-
   const idx=ths.findIndex(th=>{
     const x=label(th);
     return x.includes('itemsold') || x.includes('itemssold');
   });
-  if(idx<0){
-    const heads=ths.map(th=>(th.innerText||th.textContent||'').replace(/\s+/g,' ').trim()).join(' || ');
-    return 'item-sold-missing:headers=' + heads.slice(0,500);
-  }
+  if(idx<0)return 'item-sold-missing:verify';
 
   const th=ths[idx];
   const aria=((th.getAttribute('aria-sort')||'') || (th.querySelector('[aria-sort]')?.getAttribute('aria-sort')||'')).toLowerCase();
@@ -234,15 +229,51 @@ ITEM_SOLD_VERIFY_JS = r"""(()=>{
     if(m[2])v*=m[2].toLowerCase()==='k'?1000:1000000;
     return v;
   };
-  const vals=[...tbl.querySelectorAll('tbody tr')].slice(0,8)
+  const vals=[...tbl.querySelectorAll('tbody tr')].slice(0,20)
     .map(r=>parseVal(r.querySelectorAll('td')[idx]?.innerText)).filter(v=>v!==null);
-  const desc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
+  const nonInc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
+  const strictDown=vals.some((v,i)=>i>0&&vals[i-1]>v);
+  const desc=nonInc&&strictDown;
+  const sample=vals.slice(0,8).join(',');
 
-  if(aria==='descending'||desc)return 'item-sold-desc-ok:index=' + idx;
+  if(aria==='descending'||desc)
+    return 'item-sold-desc-ok:index=' + idx + ':sample=' + sample;
 
+  // Still ascending/flat? Click again. This catches the common first-click = low->high state.
   const clicker=th.querySelector('button,[role="button"],[tabindex]')||th;
   clicker.click();
-  return 'item-sold-clicked-again:index=' + idx;
+  return 'item-sold-clicked-again:index=' + idx + ':sample=' + sample;
+})()"""
+
+ITEM_SOLD_FINAL_JS = r"""(()=>{
+  const tables=[...document.querySelectorAll('table')];
+  const tbl=tables.find(t=>{
+    const txt=(t.querySelector('thead')?.innerText||'').toLowerCase();
+    return txt.includes('product') && (txt.includes('revenue') || txt.includes('commission'));
+  }) || tables[0];
+  if(!tbl)return 'item-sold-final:missing-table';
+  const ths=[...tbl.querySelectorAll('thead th')];
+  const clean=s=>String(s||'').toLowerCase().replace(/[^a-z]/g,'');
+  const idx=ths.findIndex(th=>{
+    const x=[th.innerText,th.textContent,th.getAttribute('aria-label'),th.getAttribute('title')]
+      .map(clean).join('|');
+    return x.includes('itemsold')||x.includes('itemssold');
+  });
+  if(idx<0)return 'item-sold-final:missing-header';
+  const th=ths[idx];
+  const aria=((th.getAttribute('aria-sort')||'') || (th.querySelector('[aria-sort]')?.getAttribute('aria-sort')||'')).toLowerCase();
+  const parseVal=s=>{
+    const m=String(s||'').replace(/,/g,'').trim().match(/([\d.]+)\s*([km])?/i);
+    if(!m)return null; let v=parseFloat(m[1]);
+    if(m[2])v*=m[2].toLowerCase()==='k'?1000:1000000;
+    return v;
+  };
+  const vals=[...tbl.querySelectorAll('tbody tr')].slice(0,20)
+    .map(r=>parseVal(r.querySelectorAll('td')[idx]?.innerText)).filter(v=>v!==null);
+  const nonInc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
+  const strictDown=vals.some((v,i)=>i>0&&vals[i-1]>v);
+  const desc=(aria==='descending')||(nonInc&&strictDown);
+  return 'item-sold-final:' + (desc?'DESC':'NOT_DESC') + ':sample=' + vals.slice(0,10).join(',');
 })()"""
 
 def pull(preset):
@@ -272,6 +303,7 @@ def pull(preset):
         {"type": "wait", "milliseconds": 1500},
         {"type": "executeJavascript", "script": ITEM_SOLD_VERIFY_JS},
         {"type": "wait", "milliseconds": 1500},
+        {"type": "executeJavascript", "script": ITEM_SOLD_FINAL_JS},
         # Bump page size 10 -> 50 (shadcn "N/Page" combobox) so one read covers the batch.
         {"type": "executeJavascript", "script": "(()=>{const b=[...document.querySelectorAll('[role=combobox]')].find(e=>/\\/\\s*page/i.test(e.textContent||''));if(b){b.click();return 'opened'}return 'nocombo'})()"},
         {"type": "wait", "milliseconds": 1500},
@@ -280,10 +312,18 @@ def pull(preset):
         {"type": "executeJavascript", "script": ROWS_JS},
     ]
     vals = fc(acts, f"pull:{preset}")
+    global LAST_SORT_MSGS
     sort_msgs = [v for v in vals
                  if isinstance(v, str) and v.startswith("item-sold-")]
+    LAST_SORT_MSGS = list(sort_msgs)
     for m in sort_msgs:
         log(f"  Item Sold sort: {m}")
+    final_sort = next((m for m in reversed(sort_msgs) if m.startswith("item-sold-final:")), "")
+    if not final_sort.startswith("item-sold-final:DESC"):
+        raise RuntimeError(
+            "Item Sold could not be verified highest-to-lowest; refusing to vet a possibly low-to-high page. "
+            + (final_sort or "No final Item Sold diagnostic was returned.")
+        )
     data = None
     for v in vals:
         if isinstance(v, str) and v.lstrip().startswith("{"):
@@ -311,6 +351,7 @@ def pull(preset):
         "grow": col("growth"),
         "price": col("avg", "unit price"),
         "comm": col("commission"),
+        "sold": col("item sold", "items sold"),
         "creat": col("creator count", "creator"),
         "conv": col("conversion", "cvr"),
     }
@@ -329,7 +370,13 @@ def pull(preset):
         out.append({"id": row.get("id"), "img": row.get("img"), "name": name[:160],
                     "revenue": num(cell(c, "rev")), "growth": num(cell(c, "grow")),
                     "avg_price": num(cell(c, "price")), "commission": num(cell(c, "comm")),
+                    "items_sold": num(cell(c, "sold")),
                     "creators": num(cell(c, "creat")), "conv": num(cell(c, "conv"))})
+    # Backup sort in Python too. This cannot recover products that were not on the
+    # fetched page, but it guarantees the top 12 are the highest Item Sold values
+    # among the 50 rows Firecrawl returned.
+    if any(p.get("items_sold") is not None for p in out):
+        out.sort(key=lambda p: p.get("items_sold") if p.get("items_sold") is not None else -1, reverse=True)
     return [p for p in out if p["revenue"] is not None]
 
 def detail_url(pid):
@@ -369,8 +416,10 @@ DETAIL_JS = r"""JSON.stringify((()=>{
   return {shop, ads, img, imgs, conv};
 })())"""
 
-def vet(cands):
+def vet(cands, audit_rejects=None):
     kept = []
+    if audit_rejects is None:
+        audit_rejects = []
     detail_signal = False   # did the detail-page scrape return ANY real ad/shop data?
     for i in range(0, len(cands), 3):
         chunk = cands[i:i+3]
@@ -416,6 +465,17 @@ def vet(cands):
                 kept.append(p)
                 log(f"  KEEP {p['name'][:48]} | {shop or 'shop?'} | ads {ads}/10")
             else:
+                reason = f"ads {ads}/10 (<7)" if brand_ok else f"shop/brand check failed; ads {ads}/10"
+                audit_rejects.append({
+                    "product": p.get("name", ""),
+                    "reason": reason,
+                    "item_sold": p.get("items_sold"),
+                    "avg_price": p.get("avg_price"),
+                    "commission_pct": p.get("commission"),
+                    "per_sale_$": round((p.get("avg_price") or 0) * (p.get("commission") or 0) / 100, 2),
+                    "ads_top10": ads,
+                    "shop": shop,
+                })
                 log(f"  cut  {p['name'][:48]} | shop={shop!r} ads={ads}")
         time.sleep(10)
     if not kept and cands and not detail_signal:
@@ -516,17 +576,44 @@ def main():
     pool = pull(preset)
     log(f"pulled {len(pool)} products")
     keep = []
+    base_rejects = []
     for p in pool:
-        if any(b in p["name"].lower() for b in RESTRICTED): continue
+        name_l = p["name"].lower()
         price = p["avg_price"] or 0
-        if price < 8 or price * (p["commission"] or 0) / 100 < 3.00: continue
+        per_sale = price * (p["commission"] or 0) / 100
+        reason = None
+        if any(b in name_l for b in RESTRICTED):
+            reason = "restricted product/brand name"
+        elif price < 8:
+            reason = f"avg price ${price:.2f} (<$8)"
+        elif per_sale < 3.00:
+            reason = f"commission per sale ${per_sale:.2f} (<$3)"
+        if reason:
+            base_rejects.append({
+                "product": p.get("name", ""),
+                "reason": reason,
+                "item_sold": p.get("items_sold"),
+                "avg_price": p.get("avg_price"),
+                "commission_pct": p.get("commission"),
+                "per_sale_$": round(per_sale, 2),
+                "ads_top10": None,
+                "shop": "",
+            })
+            continue
         keep.append(p)
-    # Keep Kalodata's Item Sold (highest -> lowest) order. Do not re-sort by price/revenue
-    # here, because the first VET_TOP products should now be the strongest sellers that
-    # passed our price / commission / restricted-name filters.
+
+    # Backstop the browser sort: rank the returned rows by Item Sold in Python too.
+    # This protects the top-12 vetting order if Kalodata's sort indicator is ambiguous.
+    if any(p.get("items_sold") is not None for p in keep):
+        keep.sort(key=lambda p: p.get("items_sold") if p.get("items_sold") is not None else -1, reverse=True)
+        log("  Item Sold top sample after local sort: " + ", ".join(
+            str(int(p["items_sold"])) if isinstance(p.get("items_sold"), (int, float)) else "?"
+            for p in keep[:10]
+        ))
     # The AD-icon + shop safety check is MANDATORY and runs by default: it opens each
     # product's detail page and counts how many of its top videos are running ads (7+ = strong,
     # under 7 = cut). This is what keeps your TikTok account alive. Do not skip it.
+    vet_rejects = []
     if ENV.get("SKIP_VET") == "1":
         log(f"SKIP_VET=1 set — passing top {min(VET_TOP, len(keep))} through WITHOUT the AD safety check (review them yourself!)")
         final = keep[:VET_TOP]
@@ -535,7 +622,8 @@ def main():
             p["ads"] = None
     else:
         log(f"{len(keep)} pass filters, vetting top {min(VET_TOP, len(keep))}")
-        final = vet(keep[:VET_TOP])
+        vet_rejects = []
+        final = vet(keep[:VET_TOP], vet_rejects)
     # Image candidates per winner: Kalodata cover + detail-page alternates + the
     # TikTok Shop og:image. The app vision-picks the human-free product-only shot.
     for p in final:
@@ -549,14 +637,15 @@ def main():
         p["image_candidates"] = cands[:6]
     imgdir = BASE / "sniped-products"
     imgdir.mkdir(exist_ok=True)
-    out = BASE / f"snipe-{preset.replace(' ','')}-{datetime.date.today()}.csv"
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out = BASE / f"snipe-{preset.replace(' ','')}-{stamp}.csv"
     saved, pushed = 0, 0
     with open(out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         # image_file/image_url lead so the AI Director import can match each row
         # to its downloaded photo. Drag the sniped-products folder into Bulk
         # Factory and drop this CSV on top; names + captions fill themselves in.
-        w.writerow(["product", "image_file", "image_url", "avg_price", "revenue_7d", "growth_pct",
+        w.writerow(["product", "image_file", "image_url", "item_sold", "avg_price", "revenue_7d", "growth_pct",
                     "commission_pct", "per_sale_$", "creators", "ads_top10", "shop", "tiktok_link",
                     "caption", "scene_prompt"])
         for p in final:
@@ -569,12 +658,44 @@ def main():
             if got:
                 saved += 1
             w.writerow([p["name"], fname if got else "", p.get("img") or "",
-                        p["avg_price"], p["revenue"], p["growth"], p["commission"],
+                        p.get("items_sold"), p["avg_price"], p["revenue"], p["growth"], p["commission"],
                         per_sale, p["creators"], p["ads"],
                         p["shop"], f"https://shop.tiktok.com/view/product/{p['id']}",
                         p["caption"], p["scene_prompt"]])
             if push_to_director(p, (imgdir / fname) if got else None):
                 pushed += 1
+    not_vetted = []
+    for p in keep[VET_TOP:]:
+        not_vetted.append({
+            "product": p.get("name", ""),
+            "reason": f"passed base filters but outside top {VET_TOP} by Item Sold",
+            "item_sold": p.get("items_sold"),
+            "avg_price": p.get("avg_price"),
+            "commission_pct": p.get("commission"),
+            "per_sale_$": round((p.get("avg_price") or 0) * (p.get("commission") or 0) / 100, 2),
+            "ads_top10": None,
+            "shop": "",
+        })
+    audit = {
+        "preset": preset,
+        "source_csv": out.name,
+        "pulled": len(pool),
+        "passed_base_filters": len(keep),
+        "vetted": min(VET_TOP, len(keep)),
+        "final_winners": len(final),
+        "criteria": {
+            "avg_price_min": 8,
+            "commission_per_sale_min": 3.00,
+            "ads_top10_min": 7,
+            "revenue_min": None,
+        },
+        "item_sold_sort_messages": list(LAST_SORT_MSGS),
+        "item_sold_top_sample": [p.get("items_sold") for p in pool[:12]],
+        "rejected": base_rejects + vet_rejects + not_vetted,
+    }
+    out.with_suffix(".audit.json").write_text(
+        json.dumps(audit, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     log(f"DONE — {len(final)} vetted products -> {out.name}")
     log(f"images -> {imgdir.name}/ ({saved}/{len(final)} downloaded)")
     if pushed:

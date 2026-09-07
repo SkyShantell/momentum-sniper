@@ -278,6 +278,44 @@ def read_archived_csv_bytes(repo_path: str) -> tuple[bytes | None, str | None]:
         return None, f"Could not decode archived CSV: {exc}"
 
 
+
+def load_run_audit(entry: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Load the optional .audit.json sidecar written by newer snipe.py runs."""
+    local_path = entry.get("local_path")
+    if isinstance(local_path, pathlib.Path):
+        audit_path = local_path.with_suffix(".audit.json")
+        if audit_path.exists():
+            try:
+                payload = json.loads(audit_path.read_text(encoding="utf-8"))
+                return (payload if isinstance(payload, dict) else None), None
+            except Exception as exc:
+                return None, f"Could not read run audit: {exc}"
+
+    # Older/private-history runs may not have an audit sidecar. Do not treat that
+    # as an error; the CSV itself remains fully usable.
+    repo_path = str(entry.get("repo_path") or "")
+    if repo_path:
+        audit_repo_path = re.sub(r"\.csv$", ".audit.json", repo_path, flags=re.I)
+        if audit_repo_path != repo_path:
+            config = queue_config()
+            encoded_path = urllib.parse.quote(audit_repo_path, safe="/")
+            endpoint = (
+                f"https://api.github.com/repos/{config['repo']}/contents/{encoded_path}?"
+                + urllib.parse.urlencode({"ref": config["branch"]})
+            )
+            status, response, error = github_api_request("GET", endpoint, config["token"])
+            if status == 200 and isinstance(response, dict):
+                try:
+                    encoded = str(response.get("content") or "").replace("\n", "")
+                    payload = json.loads(base64.b64decode(encoded).decode("utf-8"))
+                    return (payload if isinstance(payload, dict) else None), None
+                except Exception as exc:
+                    return None, f"Could not decode archived run audit: {exc}"
+            if status not in (0, 404):
+                return None, error or f"HTTP {status}"
+    return None, None
+
+
 def send_batch_to_seedance(
     csv_path: pathlib.Path,
     df: pd.DataFrame,
@@ -411,7 +449,12 @@ if run_clicked:
             reverse=True,
         )
         if completed_csvs:
-            archived, archive_message = archive_csv_to_github(completed_csvs[0])
+            newest_csv = completed_csvs[0]
+            # Always open the run that just finished instead of leaving the history
+            # selector on an older CSV from the previous Streamlit rerun.
+            st.session_state["selected_csv_history"] = newest_csv.name
+            st.session_state["latest_completed_csv"] = newest_csv.name
+            archived, archive_message = archive_csv_to_github(newest_csv)
             if archived:
                 st.session_state["history_archive_message"] = archive_message
             else:
@@ -538,7 +581,70 @@ else:
             selected_df = pd.DataFrame()
             st.error(f"Could not read this CSV: {exc}")
 
-        if not selected_df.empty:
+        audit, audit_error = load_run_audit(selected_entry)
+        if audit_error:
+            st.warning(audit_error)
+
+        if audit:
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Scanned", int(audit.get("pulled") or 0))
+            metric_cols[1].metric("Passed base filters", int(audit.get("passed_base_filters") or 0))
+            metric_cols[2].metric("Checked for ads", int(audit.get("vetted") or 0))
+            metric_cols[3].metric("Final winners", int(audit.get("final_winners") or 0))
+
+            sort_messages = [str(value) for value in (audit.get("item_sold_sort_messages") or [])]
+            final_sort_message = next(
+                (message for message in reversed(sort_messages) if message.startswith("item-sold-final:")),
+                "",
+            )
+
+            sold_sample = [
+                float(value) for value in (audit.get("item_sold_top_sample") or [])
+                if isinstance(value, (int, float))
+            ]
+            preview = ", ".join(
+                str(int(value)) if float(value).is_integer() else f"{value:g}"
+                for value in sold_sample[:10]
+            )
+
+            if "item-sold-final:DESC" in final_sort_message:
+                st.success(
+                    "Item Sold browser sort verified highest → lowest."
+                    + (f" Top sample: {preview}" if preview else "")
+                )
+            elif final_sort_message:
+                st.error(
+                    "⚠️ Item Sold browser sort was NOT verified as highest → lowest. "
+                    "This run may have started from the lowest-selling products instead."
+                    + (f" Top sample returned: {preview}" if preview else "")
+                )
+            elif sold_sample:
+                # Backward-compatible check for runs created before browser-sort diagnostics existed.
+                if max(sold_sample) <= 0:
+                    st.error(
+                        "⚠️ Item Sold check: the returned top sample is all zero. "
+                        "That strongly suggests Kalodata was still sorted low → high."
+                    )
+                elif any(sold_sample[i] < sold_sample[i + 1] for i in range(len(sold_sample) - 1)):
+                    st.warning(
+                        "⚠️ Item Sold check: the returned sample is not highest → lowest. "
+                        f"Sample: {preview}"
+                    )
+                else:
+                    st.success(f"Item Sold sample is highest → lowest: {preview}")
+
+        if selected_df.empty:
+            st.warning(
+                "No products met the final criteria in this run. "
+                "The CSV contains only its headers, so there is no winner table to display."
+            )
+            st.download_button(
+                "⬇️ Download selected CSV",
+                selected_bytes,
+                file_name=selected_entry["name"],
+                use_container_width=True,
+            )
+        else:
             st.dataframe(selected_df, use_container_width=True)
 
             action_col_1, action_col_2 = st.columns(2)
@@ -587,6 +693,21 @@ else:
                     st.session_state["latest_seedance_handoff_url"] = handoff_url
                 else:
                     st.error(message)
+
+        rejected = list((audit or {}).get("rejected") or [])
+        if rejected:
+            with st.expander(f"Why products were rejected ({len(rejected)})", expanded=selected_df.empty):
+                rejected_df = pd.DataFrame(rejected)
+                preferred = [
+                    "product", "reason", "item_sold", "avg_price",
+                    "commission_pct", "per_sale_$", "ads_top10", "shop",
+                ]
+                visible = [column for column in preferred if column in rejected_df.columns]
+                st.dataframe(
+                    rejected_df[visible] if visible else rejected_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
             handoff_url = st.session_state.get("latest_seedance_handoff_url")
             if handoff_url:
