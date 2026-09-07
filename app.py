@@ -427,7 +427,7 @@ run_clicked = st.button("Run sniper", type="primary", disabled=not preset)
 if run_clicked:
     log_box = st.empty()
     lines: list[str] = []
-    with st.spinner(f"Running sniper on '{preset}'… this usually takes 5–10 minutes."):
+    with st.spinner(f"Running sniper on '{preset}'… every qualifying product will be AD-vetted, so larger scans can take longer."):
         proc = subprocess.Popen(
             [sys.executable, str(BASE / "snipe.py"), preset],
             cwd=str(BASE),
@@ -591,58 +591,17 @@ else:
             metric_cols[1].metric("Passed base filters", int(audit.get("passed_base_filters") or 0))
             metric_cols[2].metric("Checked for ads", int(audit.get("vetted") or 0))
             metric_cols[3].metric("Final winners", int(audit.get("final_winners") or 0))
-
-            sort_messages = [str(value) for value in (audit.get("item_sold_sort_messages") or [])]
-            final_sort_message = next(
-                (message for message in reversed(sort_messages) if message.startswith("item-sold-final:")),
-                "",
-            )
-
-            sold_sample = [
-                float(value) for value in (audit.get("item_sold_top_sample") or [])
-                if isinstance(value, (int, float))
-            ]
-            preview = ", ".join(
-                str(int(value)) if float(value).is_integer() else f"{value:g}"
-                for value in sold_sample[:10]
+            st.caption(
+                "Full-vet mode: every product that passes the base filters is checked for the 7/10 AD requirement. There is no top-12 cap."
             )
 
             sort_mode = str(audit.get("item_sold_sort_mode") or "")
-            if sort_mode == "single_click_descending":
-                clicked_once = any(message.startswith("item-sold-clicked-once:") for message in sort_messages)
-                if clicked_once:
-                    st.success(
-                        "Item Sold clicked exactly once — using Kalodata's first-click highest → lowest sort."
-                        + (f" Returned sample: {preview}" if preview else "")
-                    )
-                else:
-                    st.warning(
-                        "Item Sold single-click mode was enabled, but the click confirmation was not returned."
-                    )
-            elif "item-sold-final:DESC" in final_sort_message:
-                st.success(
-                    "Item Sold browser sort verified highest → lowest."
-                    + (f" Top sample: {preview}" if preview else "")
+            if sort_mode == "disabled":
+                st.info(
+                    "Item Sold automation is disabled. This run keeps the order from your saved Kalodata preset."
                 )
-            elif final_sort_message:
-                st.error(
-                    "⚠️ Item Sold browser sort was NOT verified as highest → lowest. "
-                    "This run may have started from the lowest-selling products instead."
-                    + (f" Top sample returned: {preview}" if preview else "")
-                )
-            elif sold_sample:
-                # Backward-compatible check for older runs.
-                if max(sold_sample) <= 0:
-                    st.warning(
-                        "Item Sold sample is all zero. This older run did not use the new one-click mode."
-                    )
-                elif any(sold_sample[i] < sold_sample[i + 1] for i in range(len(sold_sample) - 1)):
-                    st.warning(
-                        "Item Sold sample is not highest → lowest. "
-                        f"Sample: {preview}"
-                    )
-                else:
-                    st.success(f"Item Sold sample is highest → lowest: {preview}")
+            else:
+                st.caption("This is an older run that may contain Item Sold sorting diagnostics.")
 
         if selected_df.empty:
             st.warning(
@@ -705,9 +664,27 @@ else:
                 else:
                     st.error(message)
 
+        all_results = list((audit or {}).get("all_results") or [])
+        if all_results:
+            st.markdown("#### Full scan results")
+            st.caption(
+                "Every scanned product is shown here: winners plus anything rejected by the base filters or the 7/10 AD check."
+            )
+            all_results_df = pd.DataFrame(all_results)
+            preferred_all = [
+                "status", "product", "reason", "item_sold", "avg_price",
+                "commission_pct", "per_sale_$", "ads_top10", "shop", "tiktok_link",
+            ]
+            visible_all = [column for column in preferred_all if column in all_results_df.columns]
+            st.dataframe(
+                all_results_df[visible_all] if visible_all else all_results_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
         rejected = list((audit or {}).get("rejected") or [])
         if rejected:
-            with st.expander(f"Why products were rejected ({len(rejected)})", expanded=selected_df.empty):
+            with st.expander(f"Rejected only ({len(rejected)})", expanded=False):
                 rejected_df = pd.DataFrame(rejected)
                 preferred = [
                     "product", "reason", "item_sold", "avg_price",

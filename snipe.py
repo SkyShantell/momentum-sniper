@@ -18,7 +18,6 @@ BASE = pathlib.Path(__file__).parent
 # Momentum's proven presets (exact filter values are in the app → Resources → Automate
 # Your Product Research). You can also pass ANY preset name you saved in your own Kalodata.
 MOMENTUM_PRESETS = ["HighTicket", "Lurkers", "Hardcore", "100 GAP"]
-VET_TOP = 12
 RESTRICTED = ["crocs", "ninja", "shark", "liquid iv", "liquid i.v"]
 TRUSTED = ["qvc"]
 LAST_SORT_MSGS = []
@@ -276,30 +275,22 @@ def pull(preset):
         # you fall back to Kalodata's default top-by-revenue list. 16s is enough paint time.
         {"type": "executeJavascript", "script": click_js},
         {"type": "wait", "milliseconds": 8000},
-        # Kalodata behavior for this table: one click on Item Sold sorts highest -> lowest.
-        # Do exactly ONE click. Do not inspect the rendered row cells and do not click again;
-        # Firecrawl can see the header before the virtualized tbody cells are exposed, which
-        # caused the old verifier to see an empty sample and incorrectly perform a second click.
-        {"type": "executeJavascript", "script": ITEM_SOLD_DESC_JS},
-        {"type": "wait", "milliseconds": 3500},
-        # Bump page size 10 -> 50 (shadcn "N/Page" combobox) so one read covers the batch.
-        {"type": "executeJavascript", "script": "(()=>{const b=[...document.querySelectorAll('[role=combobox]')].find(e=>/\\/\\s*page/i.test(e.textContent||''));if(b){b.click();return 'opened'}return 'nocombo'})()"},
-        {"type": "wait", "milliseconds": 1500},
-        {"type": "executeJavascript", "script": "(()=>{const o=[...document.querySelectorAll('[role=option],[role=menuitem]')].find(e=>/^50(\\/page)?$/i.test((e.textContent||'').replace(/\\s+/g,'')));if(o){o.click();return 'set50'}return 'no50'})()"},
-        {"type": "wait", "milliseconds": 6000},
+        # Leave Kalodata's saved preset sort/order completely untouched.
+        # Only expand the table to 50 rows, then scrape it as-is.
+        {"type": "executeJavascript", "script": "(()=>{const b=[...document.querySelectorAll('[role=combobox]')].find(e=>/\\/\\s*page/i.test(e.textContent||''));if(b){b.click();return 'page-size-opened'}return 'page-size-combo-missing'})()"},
+        {"type": "wait", "milliseconds": 1200},
+        {"type": "executeJavascript", "script": "(()=>{const o=[...document.querySelectorAll('[role=option],[role=menuitem]')].find(e=>/^50(\\/page)?$/i.test((e.textContent||'').replace(/\\s+/g,'')));if(o){o.click();return 'page-size-set50'}return 'page-size-50-missing'})()"},
+        {"type": "wait", "milliseconds": 6500},
         {"type": "executeJavascript", "script": ROWS_JS},
     ]
     vals = fc(acts, f"pull:{preset}")
     global LAST_SORT_MSGS
-    sort_msgs = [v for v in vals
-                 if isinstance(v, str) and v.startswith("item-sold-")]
-    LAST_SORT_MSGS = list(sort_msgs)
-    for m in sort_msgs:
-        log(f"  Item Sold sort: {m}")
-    # Single-click mode intentionally does not try to verify the sort from tbody values.
-    # Kalodata's table rows are virtualized and Firecrawl was returning an empty sample even
-    # though the header click fired. The previous verifier then clicked a second time, which
-    # could reverse the sort. One header click is now the source of truth.
+    LAST_SORT_MSGS = []
+    page_msgs = [v for v in vals
+                 if isinstance(v, str) and v.startswith("page-size-")]
+    for m in page_msgs:
+        log(f"  Page size: {m}")
+    log("  Item Sold automation: disabled — preserving Kalodata preset order")
     data = None
     for v in vals:
         if isinstance(v, str) and v.lstrip().startswith("{"):
@@ -310,9 +301,16 @@ def pull(preset):
             if isinstance(obj, dict) and "rows" in obj:
                 data = obj
                 break
-    if not data or not data.get("rows"):
-        return []
+    if not data:
+        raise RuntimeError("Firecrawl did not return the Kalodata product-table payload.")
     head = data.get("head", [])
+    rows = data.get("rows") or []
+    log(f"  table read: {len(rows)} row(s) | headers: {' | '.join(head)[:260]}")
+    if not rows:
+        raise RuntimeError(
+            "Kalodata product table returned 0 rows after applying the preset/page size. "
+            "The scan is stopping instead of writing an empty CSV."
+        )
 
     def col(*keys, exclude=()):
         for i, h in enumerate(head):
@@ -337,7 +335,7 @@ def pull(preset):
         return c[i] if (i is not None and i < len(c)) else None
 
     out = []
-    for row in data["rows"]:
+    for row in rows:
         c = row.get("cells", [])
         if len(c) < 4: continue
         raw = cell(c, "name") or (c[1] if len(c) > 1 else "")
@@ -348,12 +346,15 @@ def pull(preset):
                     "avg_price": num(cell(c, "price")), "commission": num(cell(c, "comm")),
                     "items_sold": num(cell(c, "sold")),
                     "creators": num(cell(c, "creat")), "conv": num(cell(c, "conv"))})
-    # Backup sort in Python too. This cannot recover products that were not on the
-    # fetched page, but it guarantees the top 12 are the highest Item Sold values
-    # among the 50 rows Firecrawl returned.
-    if any(p.get("items_sold") is not None for p in out):
-        out.sort(key=lambda p: p.get("items_sold") if p.get("items_sold") is not None else -1, reverse=True)
-    return [p for p in out if p["revenue"] is not None]
+    # Preserve Kalodata's current preset order exactly; do not re-rank by Item Sold.
+    if not out:
+        raise RuntimeError(
+            f"Kalodata returned {len(rows)} table row(s), but none could be parsed into products. "
+            f"Headers seen: {' | '.join(head)[:300]}"
+        )
+    # Revenue is informational only. The user removed the 7-day revenue requirement,
+    # so NEVER discard a product just because Kalodata did not expose/parse Revenue.
+    return out
 
 def detail_url(pid):
     today = datetime.date.today()
@@ -578,28 +579,20 @@ def main():
             continue
         keep.append(p)
 
-    # Backstop the browser sort: rank the returned rows by Item Sold in Python too.
-    # This protects the top-12 vetting order if Kalodata's sort indicator is ambiguous.
-    if any(p.get("items_sold") is not None for p in keep):
-        keep.sort(key=lambda p: p.get("items_sold") if p.get("items_sold") is not None else -1, reverse=True)
-        log("  Item Sold top sample after local sort: " + ", ".join(
-            str(int(p["items_sold"])) if isinstance(p.get("items_sold"), (int, float)) else "?"
-            for p in keep[:10]
-        ))
+    # Preserve the order returned by the saved Kalodata preset.
     # The AD-icon + shop safety check is MANDATORY and runs by default: it opens each
     # product's detail page and counts how many of its top videos are running ads (7+ = strong,
     # under 7 = cut). This is what keeps your TikTok account alive. Do not skip it.
     vet_rejects = []
     if ENV.get("SKIP_VET") == "1":
-        log(f"SKIP_VET=1 set — passing top {min(VET_TOP, len(keep))} through WITHOUT the AD safety check (review them yourself!)")
-        final = keep[:VET_TOP]
+        log(f"SKIP_VET=1 set — passing ALL {len(keep)} base-filter products through WITHOUT the AD safety check (review them yourself!)")
+        final = list(keep)
         for p in final:
             p.setdefault("shop", "")
             p["ads"] = None
     else:
-        log(f"{len(keep)} pass filters, vetting top {min(VET_TOP, len(keep))}")
-        vet_rejects = []
-        final = vet(keep[:VET_TOP], vet_rejects)
+        log(f"{len(keep)} pass filters — vetting ALL {len(keep)} products for the 7/10 AD requirement")
+        final = vet(keep, vet_rejects)
     # Image candidates per winner: Kalodata cover + detail-page alternates + the
     # TikTok Shop og:image. The app vision-picks the human-free product-only shot.
     for p in final:
@@ -640,24 +633,33 @@ def main():
                         p["caption"], p["scene_prompt"]])
             if push_to_director(p, (imgdir / fname) if got else None):
                 pushed += 1
-    not_vetted = []
-    for p in keep[VET_TOP:]:
-        not_vetted.append({
+    winner_rows = []
+    for p in final:
+        winner_rows.append({
+            "status": "WINNER",
             "product": p.get("name", ""),
-            "reason": f"passed base filters but outside top {VET_TOP} by Item Sold",
+            "reason": "passed all criteria",
             "item_sold": p.get("items_sold"),
             "avg_price": p.get("avg_price"),
             "commission_pct": p.get("commission"),
             "per_sale_$": round((p.get("avg_price") or 0) * (p.get("commission") or 0) / 100, 2),
-            "ads_top10": None,
-            "shop": "",
+            "ads_top10": p.get("ads"),
+            "shop": p.get("shop", ""),
+            "tiktok_link": f"https://shop.tiktok.com/view/product/{p.get('id')}",
         })
+
+    rejected_rows = []
+    for row in (base_rejects + vet_rejects):
+        r = dict(row)
+        r["status"] = "REJECTED"
+        rejected_rows.append(r)
+
     audit = {
         "preset": preset,
         "source_csv": out.name,
         "pulled": len(pool),
         "passed_base_filters": len(keep),
-        "vetted": min(VET_TOP, len(keep)),
+        "vetted": len(keep),
         "final_winners": len(final),
         "criteria": {
             "avg_price_min": 8,
@@ -666,14 +668,15 @@ def main():
             "revenue_min": None,
         },
         "item_sold_sort_messages": list(LAST_SORT_MSGS),
-        "item_sold_sort_mode": "single_click_descending",
-        "item_sold_top_sample": [p.get("items_sold") for p in pool[:12]],
-        "rejected": base_rejects + vet_rejects + not_vetted,
+        "item_sold_sort_mode": "disabled",
+        "item_sold_top_sample": [],
+        "rejected": base_rejects + vet_rejects,
+        "all_results": winner_rows + rejected_rows,
     }
     out.with_suffix(".audit.json").write_text(
         json.dumps(audit, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    log(f"DONE — {len(final)} vetted products -> {out.name}")
+    log(f"DONE — vetted all {len(keep)} qualifying products; {len(final)} passed final criteria -> {out.name}")
     log(f"images -> {imgdir.name}/ ({saved}/{len(final)} downloaded)")
     if pushed:
         log(f"pushed {pushed} straight to your AI Director inbox")
