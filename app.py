@@ -278,44 +278,6 @@ def read_archived_csv_bytes(repo_path: str) -> tuple[bytes | None, str | None]:
         return None, f"Could not decode archived CSV: {exc}"
 
 
-
-def load_run_audit(entry: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-    """Load the optional .audit.json sidecar written by newer snipe.py runs."""
-    local_path = entry.get("local_path")
-    if isinstance(local_path, pathlib.Path):
-        audit_path = local_path.with_suffix(".audit.json")
-        if audit_path.exists():
-            try:
-                payload = json.loads(audit_path.read_text(encoding="utf-8"))
-                return (payload if isinstance(payload, dict) else None), None
-            except Exception as exc:
-                return None, f"Could not read run audit: {exc}"
-
-    # Older/private-history runs may not have an audit sidecar. Do not treat that
-    # as an error; the CSV itself remains fully usable.
-    repo_path = str(entry.get("repo_path") or "")
-    if repo_path:
-        audit_repo_path = re.sub(r"\.csv$", ".audit.json", repo_path, flags=re.I)
-        if audit_repo_path != repo_path:
-            config = queue_config()
-            encoded_path = urllib.parse.quote(audit_repo_path, safe="/")
-            endpoint = (
-                f"https://api.github.com/repos/{config['repo']}/contents/{encoded_path}?"
-                + urllib.parse.urlencode({"ref": config["branch"]})
-            )
-            status, response, error = github_api_request("GET", endpoint, config["token"])
-            if status == 200 and isinstance(response, dict):
-                try:
-                    encoded = str(response.get("content") or "").replace("\n", "")
-                    payload = json.loads(base64.b64decode(encoded).decode("utf-8"))
-                    return (payload if isinstance(payload, dict) else None), None
-                except Exception as exc:
-                    return None, f"Could not decode archived run audit: {exc}"
-            if status not in (0, 404):
-                return None, error or f"HTTP {status}"
-    return None, None
-
-
 def send_batch_to_seedance(
     csv_path: pathlib.Path,
     df: pd.DataFrame,
@@ -398,7 +360,7 @@ if not check_password():
 env_path = BASE / ".env"
 if not env_path.exists():
     required = ["KALODATA_EMAIL", "KALODATA_PASSWORD", "FIRECRAWL_API_KEY"]
-    optional = ["DIRECTOR_INGEST_KEY", "DIRECTOR_INGEST_URL"]
+    optional = ["DIRECTOR_INGEST_KEY", "DIRECTOR_INGEST_URL", "FLOW_FASHION_API_KEY", "FLOW_FASHION_API_URL"]
     missing = [key for key in required if not get_secret(key)]
     if missing:
         st.error(f"Missing secret(s) in Streamlit Cloud settings: {', '.join(missing)}")
@@ -427,7 +389,7 @@ run_clicked = st.button("Run sniper", type="primary", disabled=not preset)
 if run_clicked:
     log_box = st.empty()
     lines: list[str] = []
-    with st.spinner(f"Running sniper on '{preset}'… every qualifying product will be AD-vetted, so larger scans can take longer."):
+    with st.spinner(f"Running sniper on '{preset}'… this usually takes 5–10 minutes."):
         proc = subprocess.Popen(
             [sys.executable, str(BASE / "snipe.py"), preset],
             cwd=str(BASE),
@@ -449,12 +411,7 @@ if run_clicked:
             reverse=True,
         )
         if completed_csvs:
-            newest_csv = completed_csvs[0]
-            # Always open the run that just finished instead of leaving the history
-            # selector on an older CSV from the previous Streamlit rerun.
-            st.session_state["selected_csv_history"] = newest_csv.name
-            st.session_state["latest_completed_csv"] = newest_csv.name
-            archived, archive_message = archive_csv_to_github(newest_csv)
+            archived, archive_message = archive_csv_to_github(completed_csvs[0])
             if archived:
                 st.session_state["history_archive_message"] = archive_message
             else:
@@ -581,40 +538,7 @@ else:
             selected_df = pd.DataFrame()
             st.error(f"Could not read this CSV: {exc}")
 
-        audit, audit_error = load_run_audit(selected_entry)
-        if audit_error:
-            st.warning(audit_error)
-
-        if audit:
-            metric_cols = st.columns(4)
-            metric_cols[0].metric("Scanned", int(audit.get("pulled") or 0))
-            metric_cols[1].metric("Passed base filters", int(audit.get("passed_base_filters") or 0))
-            metric_cols[2].metric("Checked for ads", int(audit.get("vetted") or 0))
-            metric_cols[3].metric("Final winners", int(audit.get("final_winners") or 0))
-            st.caption(
-                "Full-vet mode: every product that passes the base filters is checked for the 7/10 AD requirement. There is no top-12 cap."
-            )
-
-            sort_mode = str(audit.get("item_sold_sort_mode") or "")
-            if sort_mode == "disabled":
-                st.info(
-                    "Item Sold automation is disabled. This run keeps the order from your saved Kalodata preset."
-                )
-            else:
-                st.caption("This is an older run that may contain Item Sold sorting diagnostics.")
-
-        if selected_df.empty:
-            st.warning(
-                "No products met the final criteria in this run. "
-                "The CSV contains only its headers, so there is no winner table to display."
-            )
-            st.download_button(
-                "⬇️ Download selected CSV",
-                selected_bytes,
-                file_name=selected_entry["name"],
-                use_container_width=True,
-            )
-        else:
+        if not selected_df.empty:
             st.dataframe(selected_df, use_container_width=True)
 
             action_col_1, action_col_2 = st.columns(2)
@@ -663,39 +587,6 @@ else:
                     st.session_state["latest_seedance_handoff_url"] = handoff_url
                 else:
                     st.error(message)
-
-        all_results = list((audit or {}).get("all_results") or [])
-        if all_results:
-            st.markdown("#### Full scan results")
-            st.caption(
-                "Every scanned product is shown here: winners plus anything rejected by the base filters or the 7/10 AD check."
-            )
-            all_results_df = pd.DataFrame(all_results)
-            preferred_all = [
-                "status", "product", "reason", "item_sold", "avg_price",
-                "commission_pct", "per_sale_$", "ads_top10", "shop", "tiktok_link",
-            ]
-            visible_all = [column for column in preferred_all if column in all_results_df.columns]
-            st.dataframe(
-                all_results_df[visible_all] if visible_all else all_results_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        rejected = list((audit or {}).get("rejected") or [])
-        if rejected:
-            with st.expander(f"Rejected only ({len(rejected)})", expanded=False):
-                rejected_df = pd.DataFrame(rejected)
-                preferred = [
-                    "product", "reason", "item_sold", "avg_price",
-                    "commission_pct", "per_sale_$", "ads_top10", "shop",
-                ]
-                visible = [column for column in preferred if column in rejected_df.columns]
-                st.dataframe(
-                    rejected_df[visible] if visible else rejected_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
             handoff_url = st.session_state.get("latest_seedance_handoff_url")
             if handoff_url:
