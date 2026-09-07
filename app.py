@@ -278,6 +278,134 @@ def read_archived_csv_bytes(repo_path: str) -> tuple[bytes | None, str | None]:
         return None, f"Could not decode archived CSV: {exc}"
 
 
+
+def send_batch_to_flow_fashion(
+    df: pd.DataFrame,
+    preset_name: str,
+    source_file: str,
+) -> tuple[bool, str]:
+    """Send any saved Sniper CSV to the Flow Fashion pending inbox.
+
+    Uses the same deterministic batch identity as snipe.py so re-sending a run
+    that was already auto-pushed will not create a duplicate inbox batch.
+    """
+    api_key = (
+        get_secret("FLOW_FASHION_API_KEY").strip()
+        or get_secret("PHASE1_API_KEY").strip()
+    )
+    if not api_key:
+        return False, (
+            "Flow Fashion is not configured. Add FLOW_FASHION_API_KEY "
+            "(same value as the Flow Fashion PHASE1_API_KEY) to Streamlit Secrets."
+        )
+
+    base_url = get_secret(
+        "FLOW_FASHION_API_URL",
+        "https://flow-fashion-backend-production.up.railway.app",
+    ).strip().rstrip("/")
+
+    products: list[dict[str, Any]] = []
+    product_ids: list[str] = []
+
+    for raw_row in df.to_dict(orient="records"):
+        row = {str(key): clean_value(value) for key, value in raw_row.items()}
+        name = str(
+            row.get("product")
+            or row.get("product_name")
+            or "Unknown Product"
+        ).strip()
+        source_url = str(
+            row.get("tiktok_link")
+            or row.get("product_link")
+            or ""
+        ).strip()
+
+        if not source_url.startswith(("http://", "https://")):
+            continue
+
+        match = re.search(r"/product/(\d+)", source_url)
+        product_id = match.group(1) if match else source_url.rstrip("/").split("/")[-1]
+        product_ids.append(product_id)
+
+        sniper_meta = {
+            "avg_price": row.get("avg_price"),
+            "revenue_7d": row.get("revenue_7d"),
+            "growth_pct": row.get("growth_pct"),
+            "commission_pct": row.get("commission_pct"),
+            "per_sale_$": row.get("per_sale_$"),
+            "creators": row.get("creators"),
+            "ads_top10": row.get("ads_top10"),
+            "shop": row.get("shop"),
+        }
+        sniper_meta = {
+            key: value
+            for key, value in sniper_meta.items()
+            if value not in (None, "")
+        }
+
+        products.append(
+            {
+                "name": name or "Unknown Product",
+                "source_url": source_url,
+                "sniper_meta": sniper_meta,
+            }
+        )
+
+    if not products:
+        return False, "This CSV does not contain any valid TikTok product links."
+
+    identity = "|".join(
+        [str(preset_name or ""), str(source_file or "")]
+        + product_ids
+    )
+    source_batch_id = (
+        "momentum-"
+        + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    )
+
+    payload = {
+        "source_batch_id": source_batch_id,
+        "preset": preset_name or "Custom",
+        "source_file": source_file,
+        "products": products,
+    }
+
+    request = urllib.request.Request(
+        f"{base_url}/sniper/inbox",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-API-Key": api_key,
+        },
+        data=json.dumps(payload).encode("utf-8"),
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            body = response.read().decode("utf-8", "replace")
+        result = json.loads(body) if body else {}
+
+        status = str(result.get("status") or "pending").lower()
+        if status == "imported":
+            batch_id = str(result.get("imported_batch_id") or "").strip()
+            suffix = f" ({batch_id})" if batch_id else ""
+            return True, (
+                f"This run was already imported into Flow Fashion{suffix}. "
+                "No duplicate was created."
+            )
+
+        return True, (
+            f"Sent {len(products)} product(s) to the Flow Fashion inbox. "
+            "Open Flow Fashion, choose the avatar name, then create the batch."
+        )
+
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        return False, f"Flow Fashion rejected the run: HTTP {exc.code}: {detail}"
+    except Exception as exc:
+        return False, f"Could not send to Flow Fashion: {exc}"
+
+
 def send_batch_to_seedance(
     csv_path: pathlib.Path,
     df: pd.DataFrame,
@@ -372,8 +500,7 @@ if not env_path.exists():
 
 st.title("🎯 Momentum Sniper")
 st.caption(
-    "Pick a preset, run the hunt, then send the TikTok product links to Seedance. "
-    "Seedance re-scrapes each link to collect listing and review photos using its normal flow."
+    "Pick a preset, run the hunt, then send any current or older run to Seedance or Flow Fashion."
 )
 
 preset_choice = st.selectbox("Preset", MOMENTUM_PRESETS + ["Custom…"])
@@ -541,7 +668,7 @@ else:
         if not selected_df.empty:
             st.dataframe(selected_df, use_container_width=True)
 
-            action_col_1, action_col_2 = st.columns(2)
+            action_col_1, action_col_2, action_col_3 = st.columns(3)
             with action_col_1:
                 st.download_button(
                     "⬇️ Download selected CSV",
@@ -562,12 +689,44 @@ else:
                         "Seedance then re-scrapes every link for official and review photos."
                     ),
                 )
+            with action_col_3:
+                flow_key = (
+                    get_secret("FLOW_FASHION_API_KEY").strip()
+                    or get_secret("PHASE1_API_KEY").strip()
+                )
+                flow_send_clicked = st.button(
+                    "👗 Send to Fashion Flow",
+                    use_container_width=True,
+                    disabled=not bool(flow_key),
+                    help=(
+                        "Sends this saved Sniper run to the Flow Fashion inbox. "
+                        "It will NOT mix into the current batch. You choose the avatar in Flow Fashion first."
+                    ),
+                )
 
             if not queue_ready:
                 st.info(
                     "To enable Seedance handoff and permanent CSV history, add "
                     "`SEEDANCE_QUEUE_GITHUB_TOKEN` and `SEEDANCE_QUEUE_REPO` to this app's Streamlit Secrets."
                 )
+
+            if not flow_key:
+                st.info(
+                    "To enable **Send to Fashion Flow**, add `FLOW_FASHION_API_KEY` "
+                    "to this app's Streamlit Secrets. Use the same value as Flow Fashion's `PHASE1_API_KEY`."
+                )
+
+            if flow_send_clicked:
+                with st.spinner("Sending this saved run to the Flow Fashion inbox…"):
+                    flow_ok, flow_message = send_batch_to_flow_fashion(
+                        selected_df,
+                        preset_from_csv_name(selected_entry["name"]),
+                        selected_entry["name"],
+                    )
+                if flow_ok:
+                    st.success(flow_message)
+                else:
+                    st.error(flow_message)
 
             if send_clicked:
                 send_path = local_path
