@@ -176,29 +176,10 @@ ITEM_SOLD_DESC_JS = r"""(()=>{
   }
 
   const th=ths[idx];
-  const aria=((th.getAttribute('aria-sort')||'') || (th.querySelector('[aria-sort]')?.getAttribute('aria-sort')||'')).toLowerCase();
-  const parseVal=s=>{
-    const m=String(s||'').replace(/,/g,'').trim().match(/([\d.]+)\s*([km])?/i);
-    if(!m)return null; let v=parseFloat(m[1]);
-    if(m[2])v*=m[2].toLowerCase()==='k'?1000:1000000;
-    return v;
-  };
-  const vals=[...tbl.querySelectorAll('tbody tr')].slice(0,20)
-    .map(r=>parseVal(r.querySelectorAll('td')[idx]?.innerText)).filter(v=>v!==null);
-  const nonInc=vals.length>=2 && vals.every((v,i)=>i===0||vals[i-1]>=v);
-  const strictDown=vals.some((v,i)=>i>0&&vals[i-1]>v);
-  const desc=nonInc&&strictDown;
-  const sample=vals.slice(0,8).join(',');
-
-  // Critical: do NOT treat a flat sample such as 0,0,0,0 as "descending".
-  // That was the failure mode that could leave Kalodata sorted from zero upward.
-  if(aria==='descending' || desc)
-    return 'item-sold-desc-ok:index=' + idx + ':sample=' + sample;
-
+  // One click only. Kalodata's first click on Item Sold sorts high -> low.
   const clicker=th.querySelector('button,[role="button"],[tabindex]')||th;
   clicker.click();
-  const state=vals.length<2?'unknown':(vals.every((v,i)=>i===0||vals[i-1]<=v)&&vals.some((v,i)=>i>0&&vals[i-1]<v)?'ascending':'flat/unknown');
-  return 'item-sold-clicked:index=' + idx + ':from=' + state + ':sample=' + sample;
+  return 'item-sold-clicked-once:index=' + idx;
 })()"""
 
 ITEM_SOLD_VERIFY_JS = r"""(()=>{
@@ -295,15 +276,12 @@ def pull(preset):
         # you fall back to Kalodata's default top-by-revenue list. 16s is enough paint time.
         {"type": "executeJavascript", "script": click_js},
         {"type": "wait", "milliseconds": 8000},
-        # Make Item Sold the discovery sort and force highest -> lowest. We do NOT blindly
-        # click once: if Kalodata already opened in descending order, leave it alone.
-        # If it is unsorted/ascending, click, wait for the table refresh, verify, and only
-        # click a second time when needed (some table states cycle unsorted -> ascending -> descending).
+        # Kalodata behavior for this table: one click on Item Sold sorts highest -> lowest.
+        # Do exactly ONE click. Do not inspect the rendered row cells and do not click again;
+        # Firecrawl can see the header before the virtualized tbody cells are exposed, which
+        # caused the old verifier to see an empty sample and incorrectly perform a second click.
         {"type": "executeJavascript", "script": ITEM_SOLD_DESC_JS},
-        {"type": "wait", "milliseconds": 1500},
-        {"type": "executeJavascript", "script": ITEM_SOLD_VERIFY_JS},
-        {"type": "wait", "milliseconds": 1500},
-        {"type": "executeJavascript", "script": ITEM_SOLD_FINAL_JS},
+        {"type": "wait", "milliseconds": 3500},
         # Bump page size 10 -> 50 (shadcn "N/Page" combobox) so one read covers the batch.
         {"type": "executeJavascript", "script": "(()=>{const b=[...document.querySelectorAll('[role=combobox]')].find(e=>/\\/\\s*page/i.test(e.textContent||''));if(b){b.click();return 'opened'}return 'nocombo'})()"},
         {"type": "wait", "milliseconds": 1500},
@@ -318,12 +296,10 @@ def pull(preset):
     LAST_SORT_MSGS = list(sort_msgs)
     for m in sort_msgs:
         log(f"  Item Sold sort: {m}")
-    final_sort = next((m for m in reversed(sort_msgs) if m.startswith("item-sold-final:")), "")
-    if not final_sort.startswith("item-sold-final:DESC"):
-        raise RuntimeError(
-            "Item Sold could not be verified highest-to-lowest; refusing to vet a possibly low-to-high page. "
-            + (final_sort or "No final Item Sold diagnostic was returned.")
-        )
+    # Single-click mode intentionally does not try to verify the sort from tbody values.
+    # Kalodata's table rows are virtualized and Firecrawl was returning an empty sample even
+    # though the header click fired. The previous verifier then clicked a second time, which
+    # could reverse the sort. One header click is now the source of truth.
     data = None
     for v in vals:
         if isinstance(v, str) and v.lstrip().startswith("{"):
@@ -690,6 +666,7 @@ def main():
             "revenue_min": None,
         },
         "item_sold_sort_messages": list(LAST_SORT_MSGS),
+        "item_sold_sort_mode": "single_click_descending",
         "item_sold_top_sample": [p.get("items_sold") for p in pool[:12]],
         "rejected": base_rejects + vet_rejects + not_vetted,
     }

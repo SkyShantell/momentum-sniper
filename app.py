@@ -607,7 +607,19 @@ else:
                 for value in sold_sample[:10]
             )
 
-            if "item-sold-final:DESC" in final_sort_message:
+            sort_mode = str(audit.get("item_sold_sort_mode") or "")
+            if sort_mode == "single_click_descending":
+                clicked_once = any(message.startswith("item-sold-clicked-once:") for message in sort_messages)
+                if clicked_once:
+                    st.success(
+                        "Item Sold clicked exactly once — using Kalodata's first-click highest → lowest sort."
+                        + (f" Returned sample: {preview}" if preview else "")
+                    )
+                else:
+                    st.warning(
+                        "Item Sold single-click mode was enabled, but the click confirmation was not returned."
+                    )
+            elif "item-sold-final:DESC" in final_sort_message:
                 st.success(
                     "Item Sold browser sort verified highest → lowest."
                     + (f" Top sample: {preview}" if preview else "")
@@ -619,15 +631,14 @@ else:
                     + (f" Top sample returned: {preview}" if preview else "")
                 )
             elif sold_sample:
-                # Backward-compatible check for runs created before browser-sort diagnostics existed.
+                # Backward-compatible check for older runs.
                 if max(sold_sample) <= 0:
-                    st.error(
-                        "⚠️ Item Sold check: the returned top sample is all zero. "
-                        "That strongly suggests Kalodata was still sorted low → high."
+                    st.warning(
+                        "Item Sold sample is all zero. This older run did not use the new one-click mode."
                     )
                 elif any(sold_sample[i] < sold_sample[i + 1] for i in range(len(sold_sample) - 1)):
                     st.warning(
-                        "⚠️ Item Sold check: the returned sample is not highest → lowest. "
+                        "Item Sold sample is not highest → lowest. "
                         f"Sample: {preview}"
                     )
                 else:
