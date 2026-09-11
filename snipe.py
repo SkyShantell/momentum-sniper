@@ -412,6 +412,63 @@ TOP_CREATOR_META_JS = r"""JSON.stringify((()=>{
   return {head,cells,handle,link,creator_id:idMatch?idMatch[1]:'',image};
 })())"""
 
+
+CLICK_CREATOR_BY_RANK_JS = r"""(()=>{
+  const rank=__RANK__;
+  const tables=[...document.querySelectorAll('table')];
+  const table=tables.find(t=>{
+    const h=(t.querySelector('thead')?.innerText||'').toLowerCase();
+    return h.includes('creator') && h.includes('revenue') && h.includes('item sold');
+  }) || tables[0];
+  if(!table)return 'ranked-creator-table-missing';
+
+  const rows=[...table.querySelectorAll('tbody tr')].filter(r=>r.querySelectorAll('td').length>3);
+  const row=rows[rank-1];
+  if(!row)return 'ranked-creator-row-missing:'+rank;
+
+  const rowText=(row.innerText||row.textContent||'').replace(/\s+/g,' ').trim();
+  const handle=(rowText.match(/@[A-Za-z0-9._-]+/)||[])[0]||'';
+
+  // Prefer a direct creator-detail link when Kalodata exposes one.
+  const link=[...row.querySelectorAll('a[href]')].find(a=>/\/creator\/detail/i.test(a.href||''));
+  if(link){
+    const href=link.href||'';
+    link.click();
+    return 'ranked-creator-clicked-link:'+rank+':'+handle+':'+href;
+  }
+
+  // Otherwise click the visible @handle text / its clickable parent.
+  const leaf=[...row.querySelectorAll('*')].find(e=>
+    !e.children.length &&
+    /^@[A-Za-z0-9._-]+$/.test((e.textContent||'').trim())
+  );
+  if(leaf){
+    const clickable=leaf.closest('a,button,[role="button"],[role="link"]');
+    if(clickable){
+      clickable.click();
+      return 'ranked-creator-clicked-handle:'+rank+':'+handle;
+    }
+
+    // Kalodata sometimes binds navigation to a wrapper div instead of a link.
+    let el=leaf;
+    for(let i=0;i<5 && el;i++){
+      const before=location.href;
+      try{el.click();}catch(_){}
+      if(location.href!==before){
+        return 'ranked-creator-clicked-wrapper:'+rank+':'+handle;
+      }
+      el=el.parentElement;
+    }
+  }
+
+  // Final fallback: click the Creator Info cell / entire row.
+  const cells=[...row.querySelectorAll('td')];
+  const firstUseful=cells.find(td=>/@[A-Za-z0-9._-]+/.test(td.innerText||'')) || cells[1] || row;
+  try{firstUseful.click();}catch(_){}
+  try{row.click();}catch(_){}
+  return 'ranked-creator-clicked-row:'+rank+':'+handle;
+})()"""
+
 CLICK_TOP_CREATOR_JS = r"""(()=>{
   const tables=[...document.querySelectorAll('table')];
   const table=tables.find(t=>{
@@ -694,24 +751,90 @@ def _creator_record_to_target(rec, rank=None):
 
 
 def pull_ranked_creators(preset, count):
-    """Return the top N creators from one saved Creator custom filter."""
-    rows, headers = pull_creators(preset)
-    targets = []
-    for idx, rec in enumerate(rows, start=1):
-        target = _creator_record_to_target(rec, rank=idx)
-        if "/creator/detail" not in target["creator_page_url"]:
-            continue
-        targets.append(target)
-        if len(targets) >= count:
-            break
+    """Open the top N creators from a saved Creator filter by clicking ranked rows.
 
-    if not targets:
-        header_preview = " | ".join(str(x) for x in headers[:12])
-        raise RuntimeError(
-            "Kalodata Creator filter returned no usable creator detail links. "
-            + (f"Headers seen: {header_preview}" if header_preview else "")
+    Kalodata's Creator ranking table does not always expose /creator/detail links
+    in the DOM returned to Firecrawl. We therefore click rank 1, rank 2, etc.
+    directly, then read the resulting creator detail URL/profile.
+    """
+    targets = []
+    seen_ids = set()
+
+    for rank in range(1, count + 1):
+        click_filter_js = _saved_filter_click_js(preset)
+        click_rank_js = CLICK_CREATOR_BY_RANK_JS.replace("__RANK__", str(rank))
+
+        acts = login_actions() + [
+            {"type": "executeJavascript", "script": "location.assign('https://www.kalodata.com/creator')"},
+            {"type": "wait", "milliseconds": 15000},
+            {"type": "executeJavascript", "script": click_filter_js},
+            {"type": "wait", "milliseconds": 7000},
+            {"type": "executeJavascript", "script": click_rank_js},
+            {"type": "wait", "milliseconds": 6000},
+            {"type": "executeJavascript", "script": CREATOR_DETAIL_META_JS},
+        ]
+
+        vals = fc(acts, f"creator-rank:{preset}:{rank}")
+        meta = None
+        statuses = []
+
+        for v in vals:
+            if isinstance(v, str) and (
+                v.startswith("preset-") or
+                v.startswith("ranked-creator-")
+            ):
+                statuses.append(v)
+                log(f"  Creator rank {rank}: {v}")
+
+            if isinstance(v, str) and v.lstrip().startswith("{"):
+                try:
+                    obj = json.loads(v)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and obj.get("creator_page_url"):
+                    meta = obj
+
+        if not meta:
+            raise RuntimeError(
+                f"Creator rank {rank} could not be opened from saved filter {preset!r}. "
+                f"Status: {' | '.join(statuses) or 'none'}"
+            )
+
+        creator_url = str(meta.get("creator_page_url") or "")
+        if "/creator/detail" not in creator_url:
+            raise RuntimeError(
+                f"Clicked creator rank {rank}, but Kalodata did not open a creator detail page. "
+                f"Current page: {creator_url or 'unknown'} | "
+                f"Status: {' | '.join(statuses) or 'none'}"
+            )
+
+        creator_id = str(meta.get("creator_id") or "")
+        handle = str(meta.get("handle") or "")
+        dedupe_key = creator_id or handle.lower() or creator_url
+        if dedupe_key in seen_ids:
+            raise RuntimeError(
+                f"Creator rank {rank} resolved to the same creator as an earlier rank "
+                f"({handle or creator_id or creator_url}). Stopping instead of rescanning duplicates."
+            )
+        seen_ids.add(dedupe_key)
+
+        target = {
+            "handle": handle,
+            "name": str(meta.get("name") or ""),
+            "creator_id": creator_id,
+            "creator_page_url": creator_url,
+            "creator_revenue": None,
+            "profile_image": str(meta.get("profile_image") or ""),
+            "creator_rank": rank,
+        }
+        targets.append(target)
+        log(
+            f"  selected #{rank}: "
+            f"{target.get('handle') or target.get('name') or target.get('creator_id')}"
         )
+
     return targets
+
 
 
 def find_creator_by_name(query):

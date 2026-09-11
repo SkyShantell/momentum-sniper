@@ -577,7 +577,7 @@ else:
             "How many top creators should be checked?",
             options=list(range(1, 11)),
             index=0,
-            help="Each creator contributes up to 10 products from the first Product page.",
+            help="Sniper clicks each creator directly by rank, then checks up to 10 products from that creator’s first Product page.",
         )
         st.caption(
             f"This will check up to {creator_count * 10} creator-product candidates: "
