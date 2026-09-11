@@ -537,25 +537,102 @@ if not env_path.exists():
 
 st.title("🎯 Momentum Sniper")
 st.caption(
-    "Pick a preset, run the hunt, then send any current or older run to Seedance or Fashion Flow."
+    "Scan Kalodata two ways: Product runs your normal product preset; Creator can scan the top N creators from a saved Creator filter or jump directly to a specific creator, then vet the products they are successfully selling."
 )
 
-preset_choice = st.selectbox("Preset", MOMENTUM_PRESETS + ["Custom…"])
-if preset_choice == "Custom…":
-    preset = st.text_input(
-        "Custom preset name (must match a filter saved in Kalodata)"
-    ).strip()
-else:
-    preset = preset_choice
+scan_type = st.radio(
+    "Scan type",
+    ["Product", "Creator"],
+    horizontal=True,
+    help="Product uses the existing product-vetting flow. Creator opens Kalodata's Creator tab and scans a saved Creator custom filter.",
+)
 
-run_clicked = st.button("Run sniper", type="primary", disabled=not preset)
+creator_source_key = "filter"
+creator_count = 1
+creator_query = ""
+
+if scan_type == "Product":
+    preset_choice = st.selectbox("Preset", MOMENTUM_PRESETS + ["Custom…"])
+    if preset_choice == "Custom…":
+        preset = st.text_input(
+            "Custom product preset name (must match a filter saved in Kalodata)"
+        ).strip()
+    else:
+        preset = preset_choice
+else:
+    creator_source = st.radio(
+        "Creator source",
+        ["Saved Creator filter", "Specific creator"],
+        horizontal=True,
+    )
+
+    if creator_source == "Saved Creator filter":
+        creator_source_key = "filter"
+        preset = st.text_input(
+            "Creator custom filter name",
+            placeholder="Example: women",
+            help="Enter the exact name shown under My Custom Filters on Kalodata's Creator page.",
+        ).strip()
+        creator_count = st.selectbox(
+            "How many top creators should be checked?",
+            options=list(range(1, 11)),
+            index=0,
+            help="Each creator contributes up to 10 products from the first Product page.",
+        )
+        st.caption(
+            f"This will check up to {creator_count * 10} creator-product candidates: "
+            f"the top {creator_count} creator{'s' if creator_count != 1 else ''} in that saved filter, "
+            "then each creator's Product section."
+        )
+    else:
+        creator_source_key = "name"
+        creator_query = st.text_input(
+            "Creator name or @handle",
+            placeholder="@torijflow or Tori Flowers",
+            help="Momentum Sniper will use Kalodata's Creator search box, open the best matching creator, then scan that creator's Product section.",
+        ).strip()
+        preset = creator_query
+        st.caption(
+            "Specific Creator mode searches Kalodata for that name/handle, opens the matching creator, "
+            "checks the top 10 products in their Product section, and runs the same strict product vetting."
+        )
+
+    st.caption(
+        "Creator-sourced products are kept only when avg price ≥ $8, commission is ≥ $3 per sale, "
+        "and at least 7/10 top videos are running ads."
+    )
+
+run_clicked = st.button(
+    "Run product sniper"
+    if scan_type == "Product"
+    else (
+        f"Scan top {creator_count} creator{'s' if creator_count != 1 else ''}"
+        if creator_source_key == "filter"
+        else "Scan this creator"
+    ),
+    type="primary",
+    disabled=not preset,
+)
 
 if run_clicked:
     log_box = st.empty()
     lines: list[str] = []
-    with st.spinner(f"Running sniper on '{preset}'… this usually takes 5–10 minutes."):
+    with st.spinner(
+        (
+            f"Running product sniper on '{preset}'…"
+            if scan_type == "Product"
+            else (
+                f"Scanning top {creator_count} creator{'s' if creator_count != 1 else ''} from '{preset}'…"
+                if creator_source_key == "filter"
+                else f"Scanning creator '{creator_query}'…"
+            )
+        )
+    ):
+        cmd = [sys.executable, str(BASE / "snipe.py"), preset, scan_type.lower()]
+        if scan_type == "Creator":
+            cmd += [creator_source_key, str(creator_count), creator_query]
         proc = subprocess.Popen(
-            [sys.executable, str(BASE / "snipe.py"), preset],
+            cmd,
             cwd=str(BASE),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -569,8 +646,12 @@ if run_clicked:
         proc.wait()
     if proc.returncode == 0:
         st.success("Done — see results below.")
+        pattern = "snipe-creator-products-*.csv" if scan_type == "Creator" else "snipe-*.csv"
         completed_csvs = sorted(
-            BASE.glob("snipe-*.csv"),
+            [
+                p for p in BASE.glob(pattern)
+                if scan_type == "Creator" or not p.name.startswith("snipe-creator-")
+            ],
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
@@ -580,6 +661,8 @@ if run_clicked:
                 st.session_state["history_archive_message"] = archive_message
             else:
                 st.session_state["history_archive_warning"] = archive_message
+
+            # Both modes now end in vetted product CSVs, so both can go to Fashion Flow.
             try:
                 latest_df = pd.read_csv(completed_csvs[0])
                 queued, queue_message = send_run_to_fashion_flow_queue(
@@ -595,8 +678,7 @@ if run_clicked:
 st.divider()
 st.subheader("Run history")
 st.caption(
-    "Open, preview, download, and resend any saved CSV. New runs use a timestamped filename, "
-    "so running the same preset twice in one day no longer overwrites the earlier file."
+    "Open, preview, download, and resend any product results. Creator mode results are creator-sourced products, so they can also go to Seedance or Fashion Flow."
 )
 
 if st.session_state.pop("history_archive_message", None):
@@ -654,7 +736,7 @@ if archive_list_error:
     st.warning(f"Could not load the private CSV archive: {archive_list_error}")
 
 if not history_entries:
-    st.info("No runs yet. Pick a preset above and hit Run sniper.")
+    st.info("No runs yet. Choose Product or Creator above and run a scan.")
 else:
     controls_col_1, controls_col_2 = st.columns([2.4, 1])
     with controls_col_1:
@@ -720,6 +802,10 @@ else:
         if not selected_df.empty:
             st.dataframe(selected_df, use_container_width=True)
 
+            is_product_run = "tiktok_link" in selected_df.columns
+            if not is_product_run:
+                st.info("This older CSV does not contain product links, so product handoffs are disabled.")
+
             action_col_1, action_col_2, action_col_3 = st.columns(3)
             with action_col_1:
                 st.download_button(
@@ -735,7 +821,7 @@ else:
                     "🚀 Send selected run to Seedance",
                     type="primary",
                     use_container_width=True,
-                    disabled=not queue_ready,
+                    disabled=(not queue_ready or not is_product_run),
                     help=(
                         "Queues the TikTok links, names, captions, scene prompts, and Sniper metrics. "
                         "Seedance then re-scrapes every link for official and review photos."
@@ -749,7 +835,7 @@ else:
                 flow_send_clicked = st.button(
                     "👗 Send to Fashion Flow",
                     use_container_width=True,
-                    disabled=not flow_sheet_ready,
+                    disabled=(not flow_sheet_ready or not is_product_run),
                     help=(
                         "Queues this saved run into the same Scanner Queue used by Creator Scanner. "
                         "In Flow Fashion you choose the saved avatar and destination batch before importing."
@@ -812,7 +898,7 @@ else:
 
             # Show locally downloaded product photos when they still exist.
             imgdir = BASE / "sniped-products"
-            if imgdir.exists() and "image_file" in selected_df.columns:
+            if is_product_run and imgdir.exists() and "image_file" in selected_df.columns:
                 wanted = set(selected_df["image_file"].dropna().astype(str))
                 imgs = [
                     imgdir / filename
