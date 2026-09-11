@@ -589,7 +589,7 @@ else:
         creator_query = st.text_input(
             "Creator name or @handle",
             placeholder="@torijflow or Tori Flowers",
-            help="Momentum Sniper will use Kalodata's Creator search box, open the best matching creator, then scan that creator's Product section.",
+            help="Enter a creator name or @handle. Handles such as @torijflow are searched as torijflow, then Sniper opens the matching creator profile and scans that creator's Product section.",
         ).strip()
         preset = creator_query
         st.caption(

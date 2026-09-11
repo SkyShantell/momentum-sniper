@@ -570,23 +570,106 @@ CREATOR_SEARCH_JS = r"""(()=>{
   )?.set;
   if(setter)setter.call(input,q);else input.value=q;
 
-  input.dispatchEvent(new Event('input',{bubbles:true}));
+  input.dispatchEvent(new InputEvent('input',{
+    bubbles:true,inputType:'insertText',data:q
+  }));
   input.dispatchEvent(new Event('change',{bubbles:true}));
   input.focus();
-  input.dispatchEvent(new KeyboardEvent('keydown',{
-    key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true
-  }));
-  input.dispatchEvent(new KeyboardEvent('keypress',{
-    key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true
-  }));
-  input.dispatchEvent(new KeyboardEvent('keyup',{
-    key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true
-  }));
 
-  const form=input.closest('form');
-  try{if(form)form.requestSubmit();}catch(_){}
+  // Kalodata's Creator search is submitted with Enter.
+  for(const type of ['keydown','keypress','keyup']){
+    input.dispatchEvent(new KeyboardEvent(type,{
+      key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true
+    }));
+  }
   return 'creator-search-submitted:'+q;
 })()"""
+
+CLICK_CREATOR_SEARCH_RESULT_JS = r"""(()=>{
+  const q=__QUERY__;
+  const norm=s=>String(s||'').toLowerCase().replace(/^@/,'').replace(/[^a-z0-9._-]+/g,'');
+
+  const all=[...document.querySelectorAll('a[href*="/creator/detail"], tbody tr, [role="option"], [role="row"], li')];
+
+  // Prefer an exact handle/name match anywhere in a result card/row.
+  let target=all.find(el=>{
+    const txt=(el.innerText||el.textContent||'').trim();
+    if(!txt)return false;
+    const pieces=txt.split(/\s+/).filter(Boolean);
+    return pieces.some(p=>norm(p)===norm(q));
+  });
+
+  // If search produced a filtered table/dropdown but text matching is odd,
+  // use the first visible creator-detail result.
+  if(!target){
+    target=[...document.querySelectorAll('a[href*="/creator/detail"]')]
+      .find(a=>{
+        const r=a.getBoundingClientRect();
+        return r.width>0 && r.height>0;
+      });
+  }
+
+  if(!target){
+    // Last fallback: exact visible text leaf, then walk upward to a clickable result.
+    const leaf=[...document.querySelectorAll('*')].find(el=>{
+      if(el.children.length)return false;
+      return norm((el.textContent||'').trim())===norm(q);
+    });
+    if(leaf)target=leaf;
+  }
+
+  if(!target)return 'creator-search-result-missing';
+
+  const directLink =
+    (target.matches?.('a[href*="/creator/detail"]') ? target : null) ||
+    target.querySelector?.('a[href*="/creator/detail"]') ||
+    target.closest?.('a[href*="/creator/detail"]');
+
+  if(directLink){
+    const href=directLink.href||'';
+    directLink.click();
+    return 'creator-search-result-clicked:'+href;
+  }
+
+  let el=target;
+  for(let i=0;i<5 && el;i++){
+    try{el.click();}catch(_){}
+    el=el.parentElement;
+  }
+  return 'creator-search-result-clicked-fallback';
+})()"""
+
+CREATOR_DETAIL_META_JS = r"""JSON.stringify((()=>{
+  const body=(document.body.innerText||'').replace(/\u00a0/g,' ');
+  const handle=(body.match(/@[A-Za-z0-9._-]+/)||[])[0]||'';
+
+  let name='';
+  if(handle){
+    const leaf=[...document.querySelectorAll('*')].find(el=>
+      !el.children.length && (el.textContent||'').trim()===handle
+    );
+    if(leaf){
+      const box=leaf.parentElement?.parentElement||leaf.parentElement;
+      const txt=(box?.innerText||'').split(/\n+/).map(x=>x.trim()).filter(Boolean);
+      name=txt.find(x=>x!==handle && !/^(follow|live recordings|grail)$/i.test(x))||'';
+    }
+  }
+
+  const idMatch=location.href.match(/[?&]id=(\d+)/);
+  const img=[...document.querySelectorAll('img[src]')].find(im=>{
+    const r=im.getBoundingClientRect();
+    return r.width>=40 && r.height>=40 && r.top<500;
+  });
+
+  return {
+    creator_page_url:location.href,
+    creator_id:idMatch?idMatch[1]:'',
+    handle,
+    name,
+    profile_image:img?.src||''
+  };
+})())"""
+
 
 
 def _creator_record_to_target(rec, rank=None):
@@ -632,117 +715,76 @@ def pull_ranked_creators(preset, count):
 
 
 def find_creator_by_name(query):
-    """Use Kalodata's Creator search box and return the first matching creator."""
-    q = str(query or "").strip()
-    if not q:
+    """Search Kalodata Creator by name/@handle and open the best visible match."""
+    raw_q = str(query or "").strip()
+    if not raw_q:
         raise RuntimeError("Enter a creator name or @handle.")
 
-    script = CREATOR_SEARCH_JS.replace("__QUERY__", json.dumps(q))
+    # Kalodata displays handles with @, but its search box is more reliable when
+    # the @ is omitted. Names are left unchanged.
+    search_q = raw_q[1:] if raw_q.startswith("@") else raw_q
+
+    search_script = CREATOR_SEARCH_JS.replace("__QUERY__", json.dumps(search_q))
+    click_script = CLICK_CREATOR_SEARCH_RESULT_JS.replace("__QUERY__", json.dumps(search_q))
+
     acts = login_actions() + [
         {"type": "executeJavascript", "script": "location.assign('https://www.kalodata.com/creator')"},
-        {"type": "wait", "milliseconds": 16000},
-        {"type": "executeJavascript", "script": script},
-        {"type": "wait", "milliseconds": 8000},
-        {"type": "executeJavascript", "script": CREATOR_ROWS_JS},
+        {"type": "wait", "milliseconds": 15000},
+        {"type": "executeJavascript", "script": search_script},
+        {"type": "wait", "milliseconds": 5000},
+        {"type": "executeJavascript", "script": click_script},
+        {"type": "wait", "milliseconds": 6000},
+        {"type": "executeJavascript", "script": CREATOR_DETAIL_META_JS},
     ]
-    vals = fc(acts, f"creator-search:{q}")
+    vals = fc(acts, f"creator-search:{raw_q}")
 
+    meta = None
+    statuses = []
     for v in vals:
         if isinstance(v, str) and v.startswith("creator-search-"):
+            statuses.append(v)
             log(f"  Creator search: {v}")
-
-    data = None
-    for v in vals:
         if isinstance(v, str) and v.lstrip().startswith("{"):
             try:
                 obj = json.loads(v)
             except Exception:
                 continue
-            if isinstance(obj, dict) and "rows" in obj and "head" in obj:
-                data = obj
+            if isinstance(obj, dict) and obj.get("creator_page_url"):
+                meta = obj
 
-    if not data or not data.get("rows"):
-        raise RuntimeError(f"No Kalodata Creator results were returned for {q!r}.")
-
-    # Reuse the same row parsing logic used by pull_creators(), but for the
-    # already-filtered search result table.
-    head = list(data.get("head") or [])
-    keys = []
-    used = {}
-    for i, h in enumerate(head):
-        base = _creator_header_key(h, i)
-        used[base] = used.get(base, 0) + 1
-        keys.append(base if used[base] == 1 else f"{base}_{used[base]}")
-
-    creator_idx = None
-    for i, h in enumerate(head):
-        hl = str(h or "").lower()
-        if "creator" in hl and "count" not in hl:
-            creator_idx = i
-            break
-
-    candidates = []
-    for row in data.get("rows") or []:
-        cells = list(row.get("cells") or [])
-        raw = ""
-        if creator_idx is not None and creator_idx < len(cells):
-            raw = str(cells[creator_idx] or "")
-        if not raw:
-            raw = str(row.get("link_text") or "")
-        if not raw:
-            raw = next((str(x) for x in cells if str(x).strip()), "")
-
-        lines = [re.sub(r"\s+", " ", x).strip() for x in raw.splitlines() if x.strip()]
-        handle = next((x for x in lines if x.startswith("@")), "")
-        creator_name = next(
-            (x for x in lines if not x.startswith("@") and not re.fullmatch(r"\d+", x)),
-            handle or (lines[0] if lines else "")
-        )
-        if not handle:
-            link_text = str(row.get("link_text") or "").strip()
-            if link_text.startswith("@"):
-                handle = link_text
-
-        rec = {
-            "creator": creator_name[:200],
-            "handle": handle[:120],
-            "creator_id": str(row.get("id") or ""),
-            "creator_url": str(row.get("link") or ""),
-            "profile_image": str(row.get("img") or ""),
-        }
-        for i, key in enumerate(keys):
-            if i < len(cells):
-                value = str(cells[i] or "").strip()
-                if value:
-                    rec[key] = value
-        candidates.append(rec)
-
-    if not candidates:
-        raise RuntimeError(f"Kalodata returned rows for {q!r}, but no creator could be parsed.")
-
-    norm_q = re.sub(r"[^a-z0-9]+", "", q.lower().lstrip("@"))
-
-    def score(rec):
-        h = re.sub(r"[^a-z0-9]+", "", str(rec.get("handle") or "").lower().lstrip("@"))
-        n = re.sub(r"[^a-z0-9]+", "", str(rec.get("creator") or "").lower())
-        if h == norm_q:
-            return 100
-        if n == norm_q:
-            return 95
-        if h.startswith(norm_q) or norm_q.startswith(h):
-            return 80
-        if norm_q and (norm_q in h or norm_q in n):
-            return 60
-        return 0
-
-    candidates.sort(key=score, reverse=True)
-    target = _creator_record_to_target(candidates[0], rank=None)
-    if "/creator/detail" not in target["creator_page_url"]:
+    if not meta:
         raise RuntimeError(
-            f"Found {target.get('handle') or target.get('name') or q}, "
-            "but Kalodata did not expose a creator detail link."
+            f"Kalodata search ran for {raw_q!r}, but no creator detail page metadata was returned. "
+            f"Search status: {' | '.join(statuses) or 'none'}"
         )
-    return target
+
+    creator_url = str(meta.get("creator_page_url") or "")
+    if "/creator/detail" not in creator_url:
+        raise RuntimeError(
+            f"Kalodata search for {raw_q!r} did not open a creator profile. "
+            f"Current page: {creator_url or 'unknown'} | "
+            f"Search status: {' | '.join(statuses) or 'none'}"
+        )
+
+    handle = str(meta.get("handle") or "")
+    if raw_q.startswith("@") and handle:
+        want = re.sub(r"[^a-z0-9._-]+", "", raw_q.lower().lstrip("@"))
+        got = re.sub(r"[^a-z0-9._-]+", "", handle.lower().lstrip("@"))
+        if want and got and want != got:
+            raise RuntimeError(
+                f"Kalodata opened {handle}, but you requested {raw_q}. "
+                "Stopping so the wrong creator is not scanned."
+            )
+
+    return {
+        "handle": handle,
+        "name": str(meta.get("name") or ""),
+        "creator_id": str(meta.get("creator_id") or ""),
+        "creator_page_url": creator_url,
+        "creator_revenue": None,
+        "profile_image": str(meta.get("profile_image") or ""),
+        "creator_rank": None,
+    }
 
 
 
