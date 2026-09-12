@@ -433,8 +433,10 @@ CLICK_CREATOR_BY_RANK_JS = r"""(()=>{
   const link=[...row.querySelectorAll('a[href]')].find(a=>/\/creator\/detail/i.test(a.href||''));
   if(link){
     const href=link.href||'';
-    link.click();
-    return 'ranked-creator-clicked-link:'+rank+':'+handle+':'+href;
+    if(href){
+      location.assign(href);
+      return 'ranked-creator-same-tab:'+rank+':'+handle+':'+href;
+    }
   }
 
   // Otherwise click the visible @handle text / its clickable parent.
@@ -684,16 +686,25 @@ CLICK_CREATOR_SEARCH_RESULT_JS = r"""(()=>{
 
   if(directLink){
     const href=directLink.href||'';
-    directLink.click();
-    return 'creator-search-result-clicked:'+href;
+    if(href){
+      // Kalodata normally opens creator profiles in a new tab. Firecrawl keeps
+      // executing actions on the original tab, so force the profile into THIS tab.
+      location.assign(href);
+      return 'creator-search-result-same-tab:'+href;
+    }
   }
 
+  // Fallback for Kalodata's JS-bound rows: temporarily intercept window.open
+  // so a click that would create a new tab navigates the current tab instead.
+  const nativeOpen=window.open;
+  window.open=(url)=>{ if(url) location.assign(String(url)); return window; };
   let el=target;
   for(let i=0;i<5 && el;i++){
     try{el.click();}catch(_){}
     el=el.parentElement;
   }
-  return 'creator-search-result-clicked-fallback';
+  setTimeout(()=>{ try{window.open=nativeOpen;}catch(_){} },1500);
+  return 'creator-search-result-clicked-fallback-same-tab';
 })()"""
 
 CREATOR_DETAIL_META_JS = r"""JSON.stringify((()=>{
@@ -751,83 +762,65 @@ def _creator_record_to_target(rec, rank=None):
 
 
 def pull_ranked_creators(preset, count):
-    """Open the top N creators from a saved Creator filter by clicking ranked rows.
+    """Resolve the top N creators from a saved Creator filter.
 
-    Kalodata's Creator ranking table does not always expose /creator/detail links
-    in the DOM returned to Firecrawl. We therefore click rank 1, rank 2, etc.
-    directly, then read the resulting creator detail URL/profile.
+    Important Kalodata behavior:
+    - Creator ranking rows do not reliably expose creator-detail hrefs to Firecrawl.
+    - Clicking a creator normally opens a NEW browser tab.
+
+    So this function first reads the ranked handles/names from the filtered table,
+    then opens each creator via Kalodata Creator search. The search navigation is
+    forced into the SAME tab so subsequent Firecrawl actions stay on the profile.
     """
+    ranked_rows, headers = pull_creators(preset)
+
+    if not ranked_rows:
+        header_preview = " | ".join(str(x) for x in headers[:12])
+        raise RuntimeError(
+            "Kalodata Creator filter returned no ranked creator rows. "
+            + (f"Headers seen: {header_preview}" if header_preview else "")
+        )
+
+    wanted = ranked_rows[:count]
     targets = []
-    seen_ids = set()
+    seen = set()
 
-    for rank in range(1, count + 1):
-        click_filter_js = _saved_filter_click_js(preset)
-        click_rank_js = CLICK_CREATOR_BY_RANK_JS.replace("__RANK__", str(rank))
-
-        acts = login_actions() + [
-            {"type": "executeJavascript", "script": "location.assign('https://www.kalodata.com/creator')"},
-            {"type": "wait", "milliseconds": 15000},
-            {"type": "executeJavascript", "script": click_filter_js},
-            {"type": "wait", "milliseconds": 7000},
-            {"type": "executeJavascript", "script": click_rank_js},
-            {"type": "wait", "milliseconds": 6000},
-            {"type": "executeJavascript", "script": CREATOR_DETAIL_META_JS},
-        ]
-
-        vals = fc(acts, f"creator-rank:{preset}:{rank}")
-        meta = None
-        statuses = []
-
-        for v in vals:
-            if isinstance(v, str) and (
-                v.startswith("preset-") or
-                v.startswith("ranked-creator-")
-            ):
-                statuses.append(v)
-                log(f"  Creator rank {rank}: {v}")
-
-            if isinstance(v, str) and v.lstrip().startswith("{"):
-                try:
-                    obj = json.loads(v)
-                except Exception:
-                    continue
-                if isinstance(obj, dict) and obj.get("creator_page_url"):
-                    meta = obj
-
-        if not meta:
+    for rank, rec in enumerate(wanted, start=1):
+        handle = str(rec.get("handle") or "").strip()
+        name = str(rec.get("creator") or "").strip()
+        query = handle or name
+        if not query:
             raise RuntimeError(
-                f"Creator rank {rank} could not be opened from saved filter {preset!r}. "
-                f"Status: {' | '.join(statuses) or 'none'}"
+                f"Creator rank {rank} was visible, but its name/handle could not be read."
             )
 
-        creator_url = str(meta.get("creator_page_url") or "")
-        if "/creator/detail" not in creator_url:
-            raise RuntimeError(
-                f"Clicked creator rank {rank}, but Kalodata did not open a creator detail page. "
-                f"Current page: {creator_url or 'unknown'} | "
-                f"Status: {' | '.join(statuses) or 'none'}"
-            )
+        log(f"  resolving creator #{rank}: {query}")
+        target = find_creator_by_name(query)
+        target["creator_rank"] = rank
 
-        creator_id = str(meta.get("creator_id") or "")
-        handle = str(meta.get("handle") or "")
-        dedupe_key = creator_id or handle.lower() or creator_url
-        if dedupe_key in seen_ids:
-            raise RuntimeError(
-                f"Creator rank {rank} resolved to the same creator as an earlier rank "
-                f"({handle or creator_id or creator_url}). Stopping instead of rescanning duplicates."
-            )
-        seen_ids.add(dedupe_key)
+        # Preserve ranking-table revenue when available.
+        revenue = rec.get("revenue")
+        if revenue is None:
+            for key, value in rec.items():
+                kl = str(key).lower()
+                if "revenue" in kl and "trend" not in kl:
+                    revenue = value
+                    break
+        target["creator_revenue"] = num(revenue) if revenue not in (None, "") else target.get("creator_revenue")
 
-        target = {
-            "handle": handle,
-            "name": str(meta.get("name") or ""),
-            "creator_id": creator_id,
-            "creator_page_url": creator_url,
-            "creator_revenue": None,
-            "profile_image": str(meta.get("profile_image") or ""),
-            "creator_rank": rank,
-        }
+        dedupe = (
+            str(target.get("creator_id") or "")
+            or str(target.get("handle") or "").lower()
+            or str(target.get("creator_page_url") or "")
+        )
+        if dedupe in seen:
+            raise RuntimeError(
+                f"Creator rank {rank} resolved to a creator already selected "
+                f"({target.get('handle') or target.get('name') or dedupe})."
+            )
+        seen.add(dedupe)
         targets.append(target)
+
         log(
             f"  selected #{rank}: "
             f"{target.get('handle') or target.get('name') or target.get('creator_id')}"
