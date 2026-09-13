@@ -32,6 +32,10 @@ try:
             f"Active: **{market_label}**. Vetting remains {symbol}8+ average price, "
             f"{symbol}3+ commission per sale, and 7/10+ ads."
         )
+        st.caption(
+            "Every scan now keeps rejected products at the bottom under **THESE WERE CUT** "
+            "with the cut reason. Automatic handoffs still send passed products only."
+        )
 
     # subprocess.Popen in app_ui.py inherits this environment variable, so both
     # Product and Creator scans use the selected market without changing the UI engine.
