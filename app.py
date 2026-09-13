@@ -29,12 +29,13 @@ try:
         market_code = "GB" if market_label.startswith("United Kingdom") else "US"
         symbol = "£" if market_code == "GB" else "$"
         st.caption(
-            f"Active: **{market_label}**. Vetting remains {symbol}8+ average price, "
+            f"Active: **{market_label}**. Main pass rules remain {symbol}8+ average price, "
             f"{symbol}3+ commission per sale, and 7/10+ ads."
         )
         st.caption(
-            "Every scan now keeps rejected products at the bottom under **THESE WERE CUT** "
-            "with the cut reason. Automatic handoffs still send passed products only."
+            "**THESE WERE CUT** now shows only commission-dollar near misses that still "
+            "have 7/10+ ads and pass the other checks. The old restricted-product name "
+            "exclusion list has been removed from all scans."
         )
 
     # subprocess.Popen in app_ui.py inherits this environment variable, so both
